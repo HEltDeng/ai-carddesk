@@ -1,0 +1,22 @@
+[Unit]
+Description=AI Carddesk fulfillment worker
+After=network.target ai-carddesk.service
+Requires=ai-carddesk.service
+[Service]
+Type=simple
+User=carddesk
+Group=carddesk
+WorkingDirectory=/opt/ai-carddesk/current
+Environment=CARDDESK_DATA=/var/lib/ai-carddesk
+Environment=CARDDESK_ORIGIN=https://ai.mychangliapp.cn
+ExecStart=/opt/ai-carddesk/venv/bin/python worker.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ai-carddesk
+[Install]
+WantedBy=multi-user.target

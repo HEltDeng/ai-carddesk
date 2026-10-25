@@ -1,0 +1,7 @@
+[Unit]
+Description=AI Carddesk daily backup
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/ai-carddesk/venv/bin/python /opt/ai-carddesk/current/deploy/backup.py
+UMask=0077
