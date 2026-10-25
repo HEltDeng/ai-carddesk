@@ -1,0 +1,9 @@
+carddesk/.venv/
+carddesk/data/
+**/__pycache__/
+.pytest_cache/
+outputs/
+*.db
+*.db-wal
+*.db-shm
+.env
