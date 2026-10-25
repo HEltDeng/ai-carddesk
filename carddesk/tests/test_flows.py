@@ -169,3 +169,37 @@ def test_order_rate_limit(env):
     m,c=env
     for n in range(10):order(c)
     assert order(c).status_code==429
+
+def test_catalog_has_brand_tiers_and_no_three_month_product(env):
+    m,c=env
+    products=c.get('/api/catalog').json()['products']
+    assert {p['category'] for p in products}=={'chatgpt','claude','grok'}
+    assert all(p['months']==1 for p in products)
+    assert not any(p['id']=='plus-3' for p in products)
+    assert [p['tier'] for p in products if p['category']=='chatgpt']==['Plus','Pro 5x','Pro 10x','Pro 20x · 续费','Pro 500']
+    assert [p['tier'] for p in products if p['category']=='claude']==['Pro','Max 5x','Max 20x']
+    assert next(p for p in products if p['id']=='gpt-pro-500')['price'] is None
+    # Startup does not restore a retired SKU or overwrite operator prices.
+    with m.db() as db:db.execute("UPDATE products SET price=15900 WHERE id='plus-1'")
+    importlib.reload(m)
+    products=c.get('/api/catalog').json()['products']
+    assert next(p for p in products if p['id']=='plus-1')['price']==15900
+
+def test_new_tier_needs_price_and_correct_brand_adapter(env):
+    m,c=env;configure(m)
+    assert order(c,product_id='gpt-pro-500').status_code==409
+    assert order(c,product_id='claude-pro').status_code==409
+    assert order(c,product_id='grok-super').status_code==409
+    assert order(c,product_id='plus-3').status_code==409
+    with m.db() as db:assert db.execute('SELECT COUNT(*) FROM orders').fetchone()[0]==0
+
+def test_admin_can_price_tier_but_not_repurpose_issued_card(env):
+    m,c=env;configure(m);admin(m,c)
+    product={'id':'gpt-pro-5x','title':'ChatGPT Pro 5x','category':'chatgpt','tier':'Pro 5x','price':69900,'active':True}
+    assert c.post('/api/admin/products',json=product).status_code==200
+    assert order(c,product_id=product['id']).json()['order']['price']==69900
+    product['category']='claude'
+    assert c.post('/api/admin/products',json=product).status_code==409
+    product['category']='chatgpt';product['price']=None
+    assert c.post('/api/admin/products',json=product).status_code==200
+    assert next(p for p in c.get('/api/catalog').json()['products'] if p['id']==product['id'])['price'] is None

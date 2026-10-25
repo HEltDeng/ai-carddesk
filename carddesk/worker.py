@@ -35,13 +35,13 @@ def tick():
             if state!=r['state']:event(c,r['id'],state)
         url=cfg(c,'provider_url');key=decrypt(cfg(c,'provider_key'))
         if not url or not key:return
-        row=c.execute("SELECT o.*,p.months FROM orders o JOIN products p ON p.id=o.product_id WHERE o.state='queued' AND o.credential IS NOT NULL ORDER BY o.created LIMIT 1").fetchone()
+        row=c.execute("SELECT o.*,p.months,p.category,p.tier FROM orders o JOIN products p ON p.id=o.product_id WHERE o.state='queued' AND o.credential IS NOT NULL ORDER BY o.created LIMIT 1").fetchone()
         if row:
             c.execute("UPDATE orders SET state='processing',updated=? WHERE id=?",(now,row['id']));event(c,row['id'],'processing')
         pending=[dict(r) for r in c.execute("SELECT * FROM orders WHERE state='processing' ORDER BY updated LIMIT 10")]
     if row:
         try:
-            payload={'reference':row['id'],'product':row['product_id'],'months':row['months'],'account':{'email':row['email'],'access_token':decrypt(row['credential'])}}
+            payload={'reference':row['id'],'product':row['product_id'],'category':row['category'],'tier':row['tier'],'months':row['months'],'account':{'email':row['email'],'access_token':decrypt(row['credential'])}}
             answer=provider_request('POST',url+'/orders',key,payload)
             apply_result(row['id'],answer)
         except Exception:

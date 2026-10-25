@@ -65,8 +65,35 @@ with db() as c:
     CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, action TEXT NOT NULL, target TEXT NOT NULL, created INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS rate_limits(key TEXT PRIMARY KEY, count INTEGER NOT NULL, window INTEGER NOT NULL);
     ''')
-    for row in [('plus-1','ChatGPT Plus',1,14900),('plus-3','ChatGPT Plus',3,42900)]:
-        c.execute('INSERT OR IGNORE INTO products(id,title,months,price) VALUES(?,?,?,?)',row)
+    # Additive migration: existing orders and issued cards retain their SKU IDs.
+    c.execute('BEGIN IMMEDIATE')
+    columns={r['name'] for r in c.execute('PRAGMA table_info(products)')}
+    for name,definition in {
+        'category':"TEXT NOT NULL DEFAULT 'chatgpt'",
+        'tier':"TEXT NOT NULL DEFAULT 'Plus'",
+        'sort_order':'INTEGER NOT NULL DEFAULT 0',
+        'price_configured':'INTEGER NOT NULL DEFAULT 1',
+    }.items():
+        if name not in columns:c.execute(f'ALTER TABLE products ADD COLUMN {name} {definition}')
+    if not c.execute("SELECT 1 FROM settings WHERE key='catalog_tiers_v2'").fetchone():
+        c.execute("UPDATE products SET active=0 WHERE id='plus-3'")
+        c.execute("UPDATE products SET category='chatgpt',tier='Plus',sort_order=10 WHERE id='plus-1'")
+        products=[
+            ('plus-1','ChatGPT Plus','chatgpt','Plus',10,14900,1),
+            ('gpt-pro-5x','ChatGPT Pro 5x','chatgpt','Pro 5x',20,1,0),
+            ('gpt-pro-10x','ChatGPT Pro 10x','chatgpt','Pro 10x',30,1,0),
+            ('gpt-pro-20x-renew','ChatGPT Pro 20x · 续费','chatgpt','Pro 20x · 续费',40,1,0),
+            ('gpt-pro-500','ChatGPT Pro 500','chatgpt','Pro 500',50,1,0),
+            ('claude-pro','Claude Pro','claude','Pro',60,1,0),
+            ('claude-max-5x','Claude Max 5x','claude','Max 5x',70,1,0),
+            ('claude-max-20x','Claude Max 20x','claude','Max 20x',80,1,0),
+            ('grok-super','SuperGrok','grok','SuperGrok',90,1,0),
+            ('grok-plus','SuperGrok Plus','grok','SuperGrok Plus',100,1,0),
+            ('grok-heavy','SuperGrok Heavy','grok','SuperGrok Heavy',110,1,0),
+        ]
+        for pid,title,category,tier,rank,price,configured in products:
+            c.execute('INSERT OR IGNORE INTO products(id,title,months,price,category,tier,sort_order,price_configured) VALUES(?,?,1,?,?,?,?,?)',(pid,title,price,category,tier,rank,configured))
+        c.execute("INSERT INTO settings(key,value) VALUES('catalog_tiers_v2','1')")
     if not c.execute('SELECT 1 FROM admins').fetchone() and not (DATA/'setup-code').exists():
         (DATA/'setup-code').write_text(secrets.token_urlsafe(32))
 
@@ -156,10 +183,16 @@ def browser_session(request:Request):
     except HTTPException:
         return session_response('customer',{'ok':True})
 
+def view_product(row):
+    p=dict(row)
+    p['price']=p['price'] if p['price_configured'] else None
+    p['account_supported']=p['category']=='chatgpt'
+    return p
+
 @app.get('/api/catalog')
 def catalog():
     with db() as c:
-        return {'products':[dict(r) for r in c.execute('SELECT * FROM products WHERE active=1 ORDER BY months')], 'payment_enabled':bool(cfg(c,'payment_url')), 'fulfillment_enabled':bool(cfg(c,'provider_url') and cfg(c,'provider_key'))}
+        return {'products':[view_product(r) for r in c.execute('SELECT * FROM products WHERE active=1 ORDER BY sort_order,id')], 'payment_enabled':bool(cfg(c,'payment_url')), 'fulfillment_enabled':bool(cfg(c,'provider_url') and cfg(c,'provider_key'))}
 
 class SessionInput(BaseModel):
     session: str = Field(max_length=18000)
@@ -214,6 +247,8 @@ def create_order(data:OrderInput,request:Request):
             return {'order':view_order(old),'lookup_key':lookup,'payment_url':payment_link(cfg(c,'payment_url'),oid,old['price']) if old['state']=='pending_payment' else ''}
         p=c.execute('SELECT * FROM products WHERE id=? AND active=1',(data.product_id,)).fetchone()
         if not p: fail('商品暂不可用',409)
+        if p['category']!='chatgpt':fail('该品类通道暂不可用',409)
+        if not p['price_configured']:fail('商品暂不可用',409)
         if not cfg(c,'provider_url') or not cfg(c,'provider_key'): fail('当前通道暂不可用',409)
         if not data.card and not cfg(c,'payment_url'): fail('当前支付暂不可用',409)
         s=parse_session(data.session)
@@ -222,7 +257,7 @@ def create_order(data:OrderInput,request:Request):
             card=c.execute('SELECT * FROM cards WHERE hash=?',(digest(data.card.strip().upper()),)).fetchone()
             if not card or card['state']!='ready' or card['product_id']!=p['id']: fail('卡密无效、已使用或套餐不符',409)
         state='queued' if data.card else 'pending_payment'
-        c.execute('INSERT INTO orders(id,owner,lookup_hash,product_id,title,price,email,state,created,updated,credential,credential_expiry,channel) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(oid,owner,digest(lookup),p['id'],f"{p['title']} · {p['months']} 个月",p['price'],s['email'],state,now,now,encrypt(s['accessToken']),min(s['expiry'],now+1800),'card' if data.card else 'payment'))
+        c.execute('INSERT INTO orders(id,owner,lookup_hash,product_id,title,price,email,state,created,updated,credential,credential_expiry,channel) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(oid,owner,digest(lookup),p['id'],p['title'],p['price'],s['email'],state,now,now,encrypt(s['accessToken']),min(s['expiry'],now+1800),'card' if data.card else 'payment'))
         if data.card: c.execute("UPDATE cards SET state='used',order_id=? WHERE hash=? AND state='ready'",(oid,digest(data.card.strip().upper())))
         event(c,oid,state)
         row=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
@@ -237,7 +272,7 @@ def check_card(data:CardInput,request:Request):
     with db() as c:
         r=c.execute("SELECT p.* FROM cards c JOIN products p ON c.product_id=p.id WHERE c.hash=? AND c.state='ready' AND p.active=1",(digest(data.card.strip().upper()),)).fetchone()
         if not r: fail('卡密无效或已使用',404)
-        return {'product':dict(r)}
+        return {'product':view_product(r)}
 
 class Lookup(BaseModel):
     order_id:str=Field(min_length=6,max_length=40)
@@ -321,20 +356,27 @@ def logout(request:Request):
 def dashboard(request:Request):
     identity(request,True)
     with db() as c:
-        return {'orders':[view_order(r) for r in c.execute('SELECT * FROM orders ORDER BY created DESC LIMIT 200')], 'products':[dict(r) for r in c.execute('SELECT * FROM products ORDER BY months')], 'cards':[dict(r) for r in c.execute('SELECT tail,product_id,state,created,order_id FROM cards ORDER BY created DESC LIMIT 200')], 'settings':{'payment_url':cfg(c,'payment_url'),'payment_secret_set':bool(cfg(c,'payment_secret')),'provider_url':cfg(c,'provider_url'),'provider_key_set':bool(cfg(c,'provider_key'))},'stats':{'orders':c.execute('SELECT COUNT(*) FROM orders').fetchone()[0],'ready_cards':c.execute("SELECT COUNT(*) FROM cards WHERE state='ready'").fetchone()[0],'paid_cents':c.execute('SELECT COALESCE(SUM(price),0) FROM orders WHERE payment_ref IS NOT NULL').fetchone()[0]}}
+        return {'orders':[view_order(r) for r in c.execute('SELECT * FROM orders ORDER BY created DESC LIMIT 200')], 'products':[view_product(r) for r in c.execute("SELECT * FROM products WHERE id!='plus-3' ORDER BY sort_order,id")], 'cards':[dict(r) for r in c.execute('SELECT tail,product_id,state,created,order_id FROM cards ORDER BY created DESC LIMIT 200')], 'settings':{'payment_url':cfg(c,'payment_url'),'payment_secret_set':bool(cfg(c,'payment_secret')),'provider_url':cfg(c,'provider_url'),'provider_key_set':bool(cfg(c,'provider_key'))},'stats':{'orders':c.execute('SELECT COUNT(*) FROM orders').fetchone()[0],'ready_cards':c.execute("SELECT COUNT(*) FROM cards WHERE state='ready'").fetchone()[0],'paid_cents':c.execute('SELECT COALESCE(SUM(price),0) FROM orders WHERE payment_ref IS NOT NULL').fetchone()[0]}}
 
 class ProductInput(BaseModel):
     id:str=Field(pattern=r'^[a-z0-9-]{2,40}$')
     title:str=Field(min_length=2,max_length=60)
-    months:int=Field(ge=1,le=12)
-    price:int=Field(ge=1,le=10000000)
+    category:str=Field(pattern=r'^(chatgpt|claude|grok)$')
+    tier:str=Field(min_length=2,max_length=40)
+    price:int | None=Field(default=None,ge=1,le=10000000)
     active:bool=True
 
 @app.post('/api/admin/products')
 def product_edit(data:ProductInput,request:Request):
     identity(request,True)
     with db() as c:
-        c.execute('INSERT INTO products VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,months=excluded.months,price=excluded.price,active=excluded.active',(data.id,data.title,data.months,data.price,data.active))
+        if data.id=='plus-3':fail('此商品已停用',409)
+        old=c.execute('SELECT category,tier FROM products WHERE id=?',(data.id,)).fetchone()
+        if old and (old['category']!=data.category or old['tier']!=data.tier):
+            # A SKU already referenced by cards/orders cannot be repurposed.
+            if c.execute('SELECT 1 FROM orders WHERE product_id=? UNION ALL SELECT 1 FROM cards WHERE product_id=? LIMIT 1',(data.id,data.id)).fetchone():
+                fail('已有订单或卡密的商品不能更换品类或档位',409)
+        c.execute('INSERT INTO products(id,title,months,price,active,category,tier,price_configured) VALUES(?,?,1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,price=excluded.price,active=excluded.active,category=excluded.category,tier=excluded.tier,price_configured=excluded.price_configured',(data.id,data.title,data.price or 1,data.active,data.category,data.tier,data.price is not None))
         c.execute('INSERT INTO audit(action,target,created) VALUES(?,?,?)',('product.update',data.id,int(time.time())))
     return {'ok':True}
 

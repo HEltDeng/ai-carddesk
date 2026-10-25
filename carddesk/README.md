@@ -4,11 +4,12 @@
 后台：https://ai.mychangliapp.cn/admin  
 部署日期：2026-10-25（Asia/Shanghai）
 
-这是自有前后端的第一版卡台，采用原生 HTML/CSS/JavaScript、FastAPI、SQLite、单独的履约进程。没有外部字体、追踪脚本或前端框架运行时。视觉参考现有「我的长理」官网线上源码的蓝白配色、1120px 内容宽度与圆角导航，按本次要求移除了说明性小字。
+这是自有前后端的卡台，采用原生 HTML/CSS/JavaScript、FastAPI、SQLite、单独的履约进程。没有外部字体、追踪脚本或前端框架运行时。2026-10-25 根据用户最新指定的 https://vipcz.vip/ 重做商城：首页采用白色页头、居中标题、胶囊分类、四列圆角卡片与黄色背景；手机单列。品牌图标为白底原色 SVG，保留本站名称和已有业务接口，移除主页面说明性小字、广告浮窗与第三方站长信息。
 
 ## 当前可用范围
 
-- 商品与周期选择；示例售价为 1 个月 149 元、3 个月 429 元，可在后台修改。
+- 品类筛选、商品卡片、购买页、浏览器前进后退与手机菜单。品类为 ChatGPT、Claude、Grok；按会员档位管理商品。原 Plus 售价保留，新增档位价格留空，可在后台配置。
+- 三个月 SKU 已下架，旧订单和已发卡密引用保留；迁移不覆盖运营人员设置的售价。新增档位未定价时不能下单，不会按内部占位值成交。
 - Session 获取入口；在用户浏览器内解析邮箱与有效期，并核对待充值账号。
 - 卡密生成、下载、摘要存储、一次性核销；并发请求通过事务防止重复兑换。
 - 订单生成、金额快照、幂等提交、个人会话查单、订单号和查询码查单。
@@ -20,6 +21,10 @@
 Session 的解析只检查格式、邮箱和有效期，不是服务提供方的账号验证。没有抓取别家私有后台、用户令牌或聊天记录。没有完成真实支付、实际会员到账或任何真实账号测试。
 
 ## 来源与选择
+
+最新视觉依据：https://vipcz.vip/，已捕获桌面、390px 手机、分类切换、商品购买页与查单页。页面尺寸、系统字体、颜色及卡片圆角按浏览器 DOM/CSS 证据实现；按用户明确要求去掉黑色图标底色与说明性小字。不同于参考站，本站保持单个账号充值与卡密兑换流程，没有接入对方购物车、客服或支付。
+
+商品命名交叉核对 https://vipcz.vip/、https://xcyun.app/store、https://learn.chatgpt.com/docs/pricing、https://claude.com/pricing 和 https://x.ai/pricing。ChatGPT 的 Pro 20x 仅作为续费商品保留；Pro 500 没有擅自标为 50x。Claude/Grok 暂无账号适配器，购买页按钮禁用，不显示 ChatGPT Session 入口。品牌图标来源见 `static/brands/SOURCES.md`。
 
 基于上级 `research/` 中 50 站样本，选取三个参考：
 
@@ -74,7 +79,7 @@ GET  {服务地址}/orders/by-reference/{本站订单号}
 创建任务请求：
 
 ```json
-{"reference":"AI…","product":"plus-1","months":1,"account":{"email":"user@example.test","access_token":"<short-lived-token>"}}
+{"reference":"AI…","product":"plus-1","category":"chatgpt","tier":"Plus","months":1,"account":{"email":"user@example.test","access_token":"<short-lived-token>"}}
 ```
 
 服务必须保证 `reference` 幂等。返回：
@@ -102,7 +107,7 @@ GET  {服务地址}/orders/by-reference/{本站订单号}
 
 ## 验收
 
-15 项自动化测试，覆盖来源检查、管理员隔离、初始化、Session 输入校验、幂等与金额、密文存储、查询权限、并发卡密、回调签名、重复支付、迟到通知、超时不重发、履约凭证和限流。合成测试数据不进入生产库。
+18 项自动化测试，覆盖来源检查、管理员隔离、初始化、Session 输入校验、幂等与金额、密文存储、查询权限、并发卡密、回调签名、重复支付、迟到通知、超时不重发、履约凭证、限流、档位迁移、不定价商品拒单及已用 SKU 身份保护。合成测试数据不进入生产库。
 
 浏览器验收覆盖桌面与 390px 手机布局、套餐切换、Session 本地核对、支付按钮禁用、后台登录、商品保存、支付配置和卡密入口。线上检查包括 DNS、HTTPS、健康接口、商品接口、服务进程与既有官网访问。
 
