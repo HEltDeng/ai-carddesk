@@ -1,55 +1,50 @@
-# Storefront comparison — 2026-10-25
+# Storefront and support QA — 2026-10-25
 
 final result: passed
 
-## Source and scope
+## Target and intentional changes
 
-Reference: https://vipcz.vip/, captured in Chrome. User explicitly selected this layout, with original brand colors on white and no explanatory small print. Preserve our own catalog, prices, backend, single-account purchase and card-redemption flow. No copying of the source merchant's identity, contact details, payment destination, delivery guarantees or sales claims.
+Visual source: https://vipcz.vip/. User explicitly requested white original-color brand marks, no explanatory gray small print, reference prices, an interactive teaching section before the catalog, original tutorials, customer support and protected bulk operations. The source merchant's identity, payment links, contacts and guarantees are not copied. The new teaching section intentionally shifts the catalog below its original position.
 
-Source evidence (relative to this project):
+## Evidence
 
-- `../outputs/vipcz-reference/desktop-all.png`, 1470 × 746 pixels / CSS viewport.
-- `../outputs/vipcz-reference/mobile-all.png`, 390 × 844 pixels / CSS viewport.
-- `../outputs/vipcz-reference/product-desktop.png`, `product-mobile.png`, `checkout-desktop.png`, `order-mobile.png`.
-- Captured public stylesheet `../outputs/vipcz-reference/site.css`; rendered DOM measurements and computed fonts/colors.
+- Source desktop: `../outputs/vipcz-reference/desktop-all.png`, 1470 × 746.
+- Source mobile: `../outputs/vipcz-reference/mobile-all.png`, 390 × 844.
+- Implementation desktop: `../outputs/carddesk-v4-desktop.png`, full page 1470 × 2977, viewport 1470 × 746.
+- Implementation mobile: `../outputs/carddesk-v4-mobile.png`, 390 × 844, scrollY 0; all five category controls completely visible, final Codex tab ends at x=364 inside a 390px viewport.
+- Narrow mobile: `../outputs/carddesk-v4-mobile-320.png`, 320 × 740.
+- Combined full-view comparisons: `../outputs/carddesk-v4-comparison-desktop.png`, `../outputs/carddesk-v4-comparison-mobile.png`. Desktop full-page capture is cropped to the matching viewport height for comparison; no density rescaling.
+- Combined focused card comparison: `../outputs/carddesk-v4-comparison-card.png`; original and current first Plus card cropped at equal 252px widths and aligned at card tops.
+- Additional states: `../outputs/carddesk-v4-help-mobile.png`, `../outputs/carddesk-v4-ticket.png`.
 
-Implementation evidence:
+All captures have 1:1 pixel/CSS dimensions. Both source and implementation were opened together for visual comparison. Original desktop captures remain relevant to unchanged reference styling; current reference Codex and Claude product pages and purchase tutorial were revisited in Chrome.
 
-- `../outputs/carddesk-v3-desktop.png`, 1470 × 746 pixels / CSS viewport.
-- `../outputs/carddesk-v3-mobile.png`, 390 × 844 pixels / CSS viewport.
-- `../outputs/carddesk-v3-checkout.png`, `carddesk-v3-order-mobile.png`.
-- Full comparisons: `../outputs/vipcz-comparison-desktop.png` and `../outputs/vipcz-comparison-mobile.png`.
-- Focused comparison: `../outputs/vipcz-comparison-card.png`.
+## Findings and corrections
 
-Screenshots use matching 1:1 pixel/CSS dimensions. Paired images were combined in the same comparison image and opened for visual review; no density resampling. State: default all-products catalog. Catalog contents differ intentionally; the first Plus card is used for the focused typography/card comparison.
+- P1, fixed: early admin script edit removed the render initializer, producing `html is not defined`. Restored separate refresh/render functions, changed asset version, then reopened the real browser dashboard, ticket list and reply view successfully.
+- P2, fixed: at 320px, onboarding choices overflowed and step labels wrapped. Changed narrow-layout choice cards to vertical contents and kept step labels on one line. Recaptured 320px: no horizontal document overflow or clipped teaching cards.
+- P2, fixed: the fifth category was clipped at 390px. Reduced mobile pill padding; screenshot and DOM bounds now show all five categories completely. At 320px the intentional horizontal strip scrolls, with keyboard navigation retained.
+- No remaining actionable P0/P1/P2 issues found. The new tutorial section occupies first-screen space as explicitly requested; catalog position is an intentional product change rather than unexplained source drift.
 
-## Findings and fidelity surfaces
+## Fidelity surfaces
 
-No outstanding actionable P0/P1/P2 findings.
+- Typography: reference system/Avenir Next/PingFang stack; desktop 60px and mobile 40px hero (36px at 320), 24px card titles and 48px prices. Tutorial uses 16px body text and 25–27px step titles; no gray microcopy.
+- Spacing/layout: 64px header, 1068px four-column grid, 252px cards with 20px gaps and 28px radii. New teaching panel shares the same width and rounds. Mobile has single-column catalog, stacked help/support layouts and compact teaching controls.
+- Colors: #18181A text, #FFB319 yellow, #E6E6EA borders and #F7F7F8 soft surfaces; original Claude orange. No source blue promotional labels, dark icon tiles or floating ads.
+- Assets: local original brand SVGs for ChatGPT, Claude, Grok and Codex; no broken images, remote image requests or faux brand glyphs. Teaching diagrams use semantic content cards, receipt rows and progress states, not replacement logos.
+- Copy/content: all 19 listed products have positive numeric reference prices; monthly subscription labels and Codex one-time integral amounts are distinct. Tutorials cover purchase/redemption, Session, ChatGPT, Codex, Claude/Grok and support. No payment-configuration warning appears in the main flow.
 
-- **Fonts:** reference Avenir Next/PingFang/Helvetica display stack and Helvetica body stack; 60px desktop / 40px mobile hero, 24px card title, 48px price. Required product titles remain readable. At 320px the hero scales to 36px.
-- **Layout:** reference 64px header, 1068px grid, 252px desktop cards, 20px gaps, 28px radii and white surfaces. Four desktop columns, two tablet columns, one mobile column. The page is shorter because the user explicitly removed supporting prose. Mobile categories stay in one horizontal capsule as requested.
-- **Colors:** reference #18181A ink, #FFB319 yellow, #E6E6EA borders, #F7F7F8 footer; active category uses yellow. No unsupported “hot-selling” label or blue promotion frame is added to our products.
-- **Assets:** locally served Lobe Icons vectors for ChatGPT, Claude and Grok. Product glyphs are 44px inside a white 96px region, with no dark background, border or shadow. Claude's original orange is preserved. Source menu and bottom-curve paths are recorded in the asset provenance file. No broken images or external asset requests.
-- **Copy:** primary pages contain names, monthly/renewal type, prices, fields and actions. No setup explanation, gray disclaimer or merchant promotional text. Blank prices display an em dash and cannot create orders. Three-month sales tier removed. Original Plus price retained; no copied competitor pricing.
-- **Purchase behavior:** the original split product/purchase-panel shape wraps our existing Session verification and checkout. No external merchant cart, credentials, payment link or checkout is used. Claude/Grok have their correct logos and disabled actions; no ChatGPT Session link is shown for them.
+## Functional checks
 
-## Interaction and responsive checks
+- Teaching tab selection and Next; product/category routing; Codex prices 84/162/305/595; original brand color/white backgrounds.
+- Desktop, 390px and 320px browser views; no document overflow at 390/320 and all images loaded.
+- Tutorials and Codex article rendered; narrow layouts readable.
+- Synthetic Session locally parsed; confirmation email shown, consent unchecked and payment button disabled. No real credentials or payment used.
+- Local support submission creates a ticket and query code; backend reads and replies; customer view displays that same reply and status. Saved evidence contains only synthetic local data.
+- Admin dashboard, ticket list and reply flow rendered successfully after correction. Backend tests cover staff permissions, claiming, revocation and bulk operations.
+- Browser error log after corrected flows: empty.
+- 35 backend tests pass, JS syntax checks pass, Git whitespace check passes.
 
-- All/ChatGPT/Claude/Grok category selection; semantic tabs and keyboard arrow/Home/End bindings.
-- Product-card navigation, individual tier links, fragment routes and browser navigation.
-- Mobile menu open, navigation and close; accessible expanded state, Escape handling and focus style.
-- Invalid Session rejected; synthetic local Session resolves to account confirmation. Consent starts unchecked. Payment disabled while the provider/payment configuration is empty; no real payment or credentials used.
-- Invalid card error and order-query screen verified. Existing order/fulfillment tests cover the protected backend state transitions.
-- Local administrator product edit and save verified with blank price; category/tier form has no three-month field.
-- 1470px desktop, 768px tablet, 390px and 320px mobile rendered. DOM overflow width equals viewport at 768/390/320. No clipped navigation or broken brand images.
-- Browser console checked during the primary flow: no JavaScript errors. An intentional invalid-card request returns the expected 400 business error.
-- 18 backend tests pass. JavaScript syntax and Git whitespace checks pass.
+## Limits
 
-## Comparison history
-
-The first completed side-by-side review found no actionable P0/P1/P2 mismatch after applying the user's explicit changes. Earlier implementation refinement reduced glyphs to 44px, aligned card titles and ordered the first row to expose all three brands before the comparison pass. No unresolved visual correction loop remains.
-
-## Follow-up limits
-
-The actual payment and upstream fulfillment integration remain outside this visual revision. This QA does not establish live subscription delivery or represent the competitor's catalog, customer support or terms as our own.
+This QA verifies the implemented storefront and first-party operations. It does not claim real payment, external account verification, email delivery, upstream recharge or membership fulfillment. Payments and upstream services remain disabled. Support is a site mailbox operated from the backend, without third-party customer-service contact details.

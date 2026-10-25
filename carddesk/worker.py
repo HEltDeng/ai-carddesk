@@ -4,7 +4,7 @@ import socket
 import time
 from urllib.parse import urlparse, quote
 import httpx
-from app import db, cfg, decrypt, event
+from app import db, cfg, decrypt, event, expire_unpaid
 
 def public_endpoint(url):
     host=urlparse(url).hostname
@@ -28,6 +28,7 @@ def tick():
     now=int(time.time())
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
+        expire_unpaid(c,now)
         expired=c.execute("SELECT id,state FROM orders WHERE credential IS NOT NULL AND credential_expiry<=?",(now,)).fetchall()
         for r in expired:
             state='needs_session' if r['state']=='queued' else ('expired' if r['state']=='pending_payment' else r['state'])
@@ -35,7 +36,7 @@ def tick():
             if state!=r['state']:event(c,r['id'],state)
         url=cfg(c,'provider_url');key=decrypt(cfg(c,'provider_key'))
         if not url or not key:return
-        row=c.execute("SELECT o.*,p.months,p.category,p.tier FROM orders o JOIN products p ON p.id=o.product_id WHERE o.state='queued' AND o.credential IS NOT NULL ORDER BY o.created LIMIT 1").fetchone()
+        row=c.execute("SELECT o.*,p.months,p.category,p.tier FROM orders o JOIN products p ON p.id=o.product_id WHERE o.state='queued' AND o.review=0 AND o.credential IS NOT NULL ORDER BY o.created LIMIT 1").fetchone()
         if row:
             c.execute("UPDATE orders SET state='processing',updated=? WHERE id=?",(now,row['id']));event(c,row['id'],'processing')
         pending=[dict(r) for r in c.execute("SELECT * FROM orders WHERE state='processing' ORDER BY updated LIMIT 10")]
