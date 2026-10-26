@@ -8,10 +8,17 @@ import re
 import secrets
 import sqlite3
 import time
+import csv
+import io
+import smtplib
+import ssl
+import socket
+import ipaddress
+from email.message import EmailMessage
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from cryptography.fernet import Fernet
@@ -36,6 +43,7 @@ CIPHER = Fernet(KEY)
 ORIGIN = os.environ.get('CARDDESK_ORIGIN', 'http://127.0.0.1:8808').rstrip('/')
 SECURE = ORIGIN.startswith('https://')
 COOKIE = '__Host-carddesk' if SECURE else 'carddesk_local'
+USER_COOKIE = '__Host-carddesk-user' if SECURE else 'carddesk_user_local'
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 @contextmanager
@@ -70,6 +78,13 @@ with db() as c:
     CREATE INDEX IF NOT EXISTS ix_tickets_source ON tickets(source_hash,created);
     CREATE INDEX IF NOT EXISTS ix_orders_owner ON orders(owner,state);
     CREATE TABLE IF NOT EXISTS rate_limits(key TEXT PRIMARY KEY, count INTEGER NOT NULL, window INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS customers(id TEXT PRIMARY KEY,username TEXT NOT NULL UNIQUE COLLATE NOCASE,password TEXT NOT NULL,email TEXT UNIQUE COLLATE NOCASE,email_verified INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1,created INTEGER NOT NULL,last_login INTEGER);
+    CREATE TABLE IF NOT EXISTS customer_sessions(token TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES customers(id),expires INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS email_challenges(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES customers(id),owner TEXT NOT NULL,email TEXT NOT NULL,purpose TEXT NOT NULL,code_hash TEXT NOT NULL,created INTEGER NOT NULL,expires INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,consumed INTEGER NOT NULL DEFAULT 0);
+    CREATE INDEX IF NOT EXISTS ix_challenge_user ON email_challenges(user_id,purpose,created);
+    CREATE TABLE IF NOT EXISTS checkout_grants(owner TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES customers(id),expires INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS email_limits(key TEXT PRIMARY KEY,count INTEGER NOT NULL,window INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS deliveries(order_id TEXT PRIMARY KEY REFERENCES orders(id),account TEXT NOT NULL,secret TEXT NOT NULL,updated INTEGER NOT NULL);
     ''')
     # Additive migration: existing orders and issued cards retain their SKU IDs.
     c.execute('BEGIN IMMEDIATE')
@@ -103,13 +118,17 @@ with db() as c:
     # One-time reference pricing. Subsequent restarts preserve operator edits.
     for table, columns in {
         'products': {'price_source': "TEXT NOT NULL DEFAULT ''"},
-        'orders': {'source_hash': "TEXT NOT NULL DEFAULT ''", 'review': "INTEGER NOT NULL DEFAULT 0"},
-        'audit': {'actor': "TEXT NOT NULL DEFAULT 'system'"},
+        'orders': {'source_hash': "TEXT NOT NULL DEFAULT ''", 'review': "INTEGER NOT NULL DEFAULT 0", 'customer_id': 'TEXT REFERENCES customers(id)', 'quantity': 'INTEGER NOT NULL DEFAULT 1', 'paid_at': 'INTEGER', 'completed_at': 'INTEGER', 'refunded_at': 'INTEGER'},
+        'audit': {'actor': "TEXT NOT NULL DEFAULT 'system'", 'source_hash': "TEXT NOT NULL DEFAULT ''", 'result': "TEXT NOT NULL DEFAULT 'success'", 'details': "TEXT NOT NULL DEFAULT '{}'", 'previous_hash': "TEXT NOT NULL DEFAULT ''", 'entry_hash': "TEXT NOT NULL DEFAULT ''"},
+        'email_challenges': {'delivered': 'INTEGER NOT NULL DEFAULT 0'},
     }.items():
         existing={r['name'] for r in c.execute(f'PRAGMA table_info({table})')}
         for name,definition in columns.items():
             if name not in existing:c.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
     c.execute('CREATE INDEX IF NOT EXISTS ix_orders_source_created ON orders(source_hash,created)')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_orders_customer ON orders(customer_id,state,created)')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_audit_created ON audit(created,id)')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_audit_action ON audit(action,created)')
     c.execute('CREATE INDEX IF NOT EXISTS ix_orders_state_created ON orders(state,created)')
     c.execute('CREATE INDEX IF NOT EXISTS ix_ticket_messages_ticket ON ticket_messages(ticket_id,id)')
     if not c.execute("SELECT 1 FROM settings WHERE key='catalog_reference_v3'").fetchone():
@@ -214,6 +233,95 @@ def session_response(role,payload):
     out.set_cookie(COOKIE,raw,httponly=True,secure=SECURE,samesite='strict',path='/',max_age=28800 if role!='customer' else 2592000)
     return out
 
+def audit_signature(row):
+    fields=('id','action','target','created','actor','source_hash','result','details','previous_hash')
+    return digest('audit:v1:'+json.dumps([row[k] for k in fields],ensure_ascii=False,separators=(',',':')))
+
+def audit_log(c,action,target='',actor='system',request=None,result='success',details=None):
+    # Call within the mutation transaction so neither the change nor its audit can be lost alone.
+    if not c.in_transaction:c.execute('BEGIN IMMEDIATE')
+    previous=c.execute('SELECT id,entry_hash FROM audit ORDER BY id DESC LIMIT 1').fetchone()
+    row={'id':previous['id']+1 if previous else 1,'action':action,'target':target,'created':int(time.time()),'actor':actor,'source_hash':source_hash(request) if request else '', 'result':result,'details':json.dumps(details or {},ensure_ascii=False,sort_keys=True),'previous_hash':previous['entry_hash'] if previous else ''}
+    row['entry_hash']=audit_signature(row)
+    c.execute('INSERT INTO audit(id,action,target,created,actor,source_hash,result,details,previous_hash,entry_hash) VALUES(:id,:action,:target,:created,:actor,:source_hash,:result,:details,:previous_hash,:entry_hash)',row)
+
+with db() as c:
+    c.execute('BEGIN IMMEDIATE')
+    if not cfg(c,'audit_chain_v1'):
+        previous=''
+        for record in c.execute('SELECT * FROM audit ORDER BY id').fetchall():
+            row=dict(record);row['previous_hash']=previous;previous=audit_signature(row)
+            c.execute('UPDATE audit SET previous_hash=?,entry_hash=? WHERE id=?',(row['previous_hash'],previous,row['id']))
+        savecfg(c,'audit_chain_v1','1')
+    c.execute("CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON audit BEGIN SELECT RAISE(ABORT,'audit is append only'); END")
+    c.execute("CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit BEGIN SELECT RAISE(ABORT,'audit is append only'); END")
+    if not cfg(c,'order_times_v1'):
+        # Derive old timestamps only from recorded events; do not invent payment times.
+        c.execute("UPDATE orders SET paid_at=(SELECT MIN(created) FROM events WHERE order_id=orders.id AND state IN ('queued','needs_session')) WHERE payment_ref IS NOT NULL")
+        c.execute("UPDATE orders SET completed_at=(SELECT MAX(created) FROM events WHERE order_id=orders.id AND state='completed'),refunded_at=(SELECT MAX(created) FROM events WHERE order_id=orders.id AND state='refunded')")
+        savecfg(c,'order_times_v1','1')
+
+def customer_session(request,required=True):
+    token=digest(request.cookies.get(USER_COOKIE,''))
+    with db() as c:
+        row=c.execute('SELECT u.*,s.token AS session_token FROM customers u JOIN customer_sessions s ON s.user_id=u.id WHERE s.token=? AND s.expires>? AND u.active=1',(token,int(time.time()))).fetchone()
+    if not row and required:fail('请先登录购买账号',401)
+    return row
+
+def verified_customer(request):
+    user=customer_session(request)
+    if not user['email_verified']:fail('请先绑定邮箱并输入验证码',403)
+    return user
+
+def customer_view(user):
+    return {k:user[k] for k in ('id','username','email','email_verified','active','created','last_login')}
+
+def issue_customer_session(c,user_id,request):
+    raw=secrets.token_urlsafe(32);now=int(time.time())
+    c.execute('DELETE FROM customer_sessions WHERE expires<=? OR token=?',(now,digest(request.cookies.get(USER_COOKIE,''))))
+    c.execute('INSERT INTO customer_sessions VALUES(?,?,?)',(digest(raw),user_id,now+604800))
+    c.execute('UPDATE customers SET last_login=? WHERE id=?',(now,user_id))
+    out=JSONResponse({'ok':True})
+    out.set_cookie(USER_COOKIE,raw,httponly=True,secure=SECURE,samesite='strict',path='/',max_age=604800)
+    return out
+
+def valid_password(password,stored):
+    candidate=password_hash(password,stored.split(':')[0] if stored else '0'*32)
+    return bool(stored) and hmac.compare_digest(candidate,stored)
+
+def normalize_email(value):
+    value=value.strip().lower()
+    if not re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+",value) or len(value)>254:fail('请输入有效邮箱')
+    return value
+
+def mail_config(c):
+    return {k:cfg(c,'smtp_'+k) for k in ('host','port','username','password','sender')}
+
+def mail_ready(c):
+    return all(mail_config(c).values())
+
+def send_email_code(config,email,code,purpose):
+    host=config['host'];port=int(config['port']);context=ssl.create_default_context()
+    if any(not ipaddress.ip_address(info[4][0]).is_global for info in socket.getaddrinfo(host,port,type=socket.SOCK_STREAM)):raise ValueError('Invalid mail host')
+    message=EmailMessage();message['From']=config['sender'];message['To']=email;message['Subject']='AI 卡台 · '+('重置密码' if purpose=='reset' else '邮箱验证码')
+    message.set_content(f'你的验证码为：{code}\n\n10 分钟内有效，请勿转发。若非本人操作，请忽略此邮件。')
+    client=smtplib.SMTP_SSL(host,port,timeout=12,context=context) if port==465 else smtplib.SMTP(host,port,timeout=12)
+    with client:
+        if port!=465:client.ehlo();client.starttls(context=context);client.ehlo()
+        client.login(config['username'],decrypt(config['password']))
+        client.send_message(message)
+
+def email_limit(c,key,maximum,seconds):
+    now=int(time.time());window=now//seconds;key=digest('email-limit:'+key+':'+str(seconds))
+    old=c.execute('SELECT * FROM email_limits WHERE key=?',(key,)).fetchone()
+    if old and old['window']==window and old['count']>=maximum:fail('验证码发送过于频繁，请稍后重试',429)
+    c.execute('INSERT INTO email_limits VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN window=excluded.window THEN count+1 ELSE 1 END,window=excluded.window',(key,window))
+
+def reauthenticate_admin(c,request,password):
+    identity(request,True);limited(request,'admin-reauth',5)
+    stored=c.execute('SELECT password FROM admins WHERE id=1').fetchone()
+    if not stored or not valid_password(password,stored['password']):fail('管理员密码不正确',403)
+
 @app.middleware('http')
 async def boundary(request,call_next):
     if request.method in ('POST','PUT','PATCH','DELETE'):
@@ -224,6 +332,10 @@ async def boundary(request,call_next):
         except ValueError:
             return JSONResponse({'detail':'请求无效'},400)
     response=await call_next(request)
+    if request.url.path.startswith('/api/') and response.status_code in (401,403,429):
+        with db() as c:
+            user=customer_session(request,False)
+            audit_log(c,'security.denied',request.url.path[:160],actor='customer:'+user['id'] if user else 'anonymous',request=request,result='denied',details={'status':response.status_code})
     response.headers.update({'X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','X-Frame-Options':'DENY','Permissions-Policy':'camera=(), microphone=(), geolocation=()','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"})
     response.headers['Cache-Control']='no-store' if request.url.path.startswith(('/api','/admin')) else 'public, max-age=300'
     return response
@@ -290,7 +402,7 @@ class OrderInput(BaseModel):
     consent:bool=False
 
 def view_order(row):
-    return {k:row[k] for k in ('id','title','price','email','state','created','updated','channel')}
+    return {k:row[k] for k in ('id','title','price','email','state','created','updated','channel','quantity','paid_at','completed_at','refunded_at','customer_id')}
 
 def expire_unpaid(c,now=None):
     now=now or int(time.time())
@@ -302,6 +414,10 @@ def expire_unpaid(c,now=None):
 
 def event(c,oid,state):
     c.execute('INSERT INTO events(order_id,state,created) VALUES(?,?,?)',(oid,state,int(time.time())))
+    if state in ('completed','refunded'):
+        column='completed_at' if state=='completed' else 'refunded_at'
+        c.execute(f'UPDATE orders SET {column}=? WHERE id=?',(int(time.time()),oid))
+    audit_log(c,'order.state',oid,details={'state':state})
 
 def payment_link(template,oid,price):
     # Only order number and amount are appended; never credentials or personal data.
@@ -311,9 +427,9 @@ def payment_link(template,oid,price):
 
 @app.post('/api/orders')
 def create_order(data:OrderInput,request:Request):
-    limited(request,'order',10); owner=identity(request)
+    limited(request,'order',10); user=verified_customer(request);owner=user['session_token']
     if not data.consent: fail('请确认服务协议和隐私政策')
-    oid='AI'+digest(owner+data.idempotency_key)[:22].upper()
+    oid='AI'+digest(user['id']+data.idempotency_key)[:22].upper()
     lookup=base64.urlsafe_b64encode(hmac.new(KEY,('lookup:'+oid).encode(),hashlib.sha256).digest()).decode()[:24]
     now=int(time.time()); source=source_hash(request)
     with db() as c:
@@ -323,6 +439,11 @@ def create_order(data:OrderInput,request:Request):
         if old:
             if old['product_id']!=data.product_id or old['email'].lower()!=data.email.strip().lower() or old['channel']!=('card' if data.card else 'payment'):fail('重复请求与原订单不一致',409)
             return {'order':view_order(old),'lookup_key':lookup,'payment_url':payment_link(cfg(c,'payment_url'),oid,old['price']) if old['state']=='pending_payment' else ''}
+        # Recheck account status in the same write transaction as order creation.
+        current=c.execute('SELECT active,email_verified FROM customers WHERE id=?',(user['id'],)).fetchone()
+        if not current or not current['active'] or not current['email_verified']:fail('账号当前不可购买',403)
+        grant=c.execute('SELECT 1 FROM checkout_grants WHERE owner=? AND user_id=? AND expires>?',(owner,user['id'],now)).fetchone()
+        if not grant:fail('请先输入邮箱验证码确认本次购买',403)
         p=c.execute('SELECT * FROM products WHERE id=? AND active=1',(data.product_id,)).fetchone()
         if not p: fail('商品暂不可用',409)
         if p['category']!='chatgpt':fail('该品类通道暂不可用',409)
@@ -336,15 +457,18 @@ def create_order(data:OrderInput,request:Request):
             if not card or card['state']!='ready' or card['product_id']!=p['id']: fail('卡密无效、已使用或套餐不符',409)
         # No unverified email can lock an account or reserve inventory.
         if not data.card:
-            pending=c.execute("SELECT COUNT(*) FROM orders WHERE owner=? AND state='pending_payment'",(owner,)).fetchone()[0]
+            pending=c.execute("SELECT COUNT(*) FROM orders WHERE customer_id=? AND state='pending_payment'",(user['id'],)).fetchone()[0]
             from_source=c.execute("SELECT COUNT(*) FROM orders WHERE source_hash=? AND state='pending_payment'",(source,)).fetchone()[0]
             hourly=c.execute('SELECT COUNT(*) FROM orders WHERE source_hash=? AND created>?',(source,now-3600)).fetchone()[0]
-            if pending>=3 or from_source>=8 or hourly>=30:fail('待支付订单过多，请先处理已有订单或稍后重试',429)
+            customer_hourly=c.execute('SELECT COUNT(*) FROM orders WHERE customer_id=? AND created>?',(user['id'],now-3600)).fetchone()[0]
+            if pending>=3 or from_source>=8 or hourly>=30 or customer_hourly>=10:fail('待支付订单过多，请先处理已有订单或稍后重试',429)
         state='queued' if data.card else 'pending_payment'
         c.execute('INSERT INTO orders(id,owner,lookup_hash,product_id,title,price,email,state,created,updated,credential,credential_expiry,channel) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(oid,owner,digest(lookup),p['id'],p['title'],p['price'],s['email'],state,now,now,encrypt(s['accessToken']),min(s['expiry'],now+(1800 if data.card else 900)),'card' if data.card else 'payment'))
-        c.execute('UPDATE orders SET source_hash=? WHERE id=?',(source,oid))
+        c.execute('UPDATE orders SET source_hash=?,customer_id=? WHERE id=?',(source,user['id'],oid))
+        c.execute('DELETE FROM checkout_grants WHERE owner=?',(owner,))
         if data.card: c.execute("UPDATE cards SET state='used',order_id=? WHERE hash=? AND state='ready'",(oid,digest(data.card.strip().upper())))
         event(c,oid,state)
+        audit_log(c,'order.create',oid,actor='customer:'+user['id'],request=request,details={'channel':'card' if data.card else 'payment','amount_cents':p['price']})
         row=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
         return {'order':view_order(row),'lookup_key':lookup,'payment_url':payment_link(cfg(c,'payment_url'),oid,p['price']) if not data.card else ''}
 
@@ -353,7 +477,7 @@ class CardInput(BaseModel):
 
 @app.post('/api/cards/check')
 def check_card(data:CardInput,request:Request):
-    limited(request,'card',10);identity(request)
+    limited(request,'card',10);verified_customer(request)
     with db() as c:
         r=c.execute("SELECT p.* FROM cards c JOIN products p ON c.product_id=p.id WHERE c.hash=? AND c.state='ready' AND p.active=1",(digest(data.card.strip().upper()),)).fetchone()
         if not r: fail('卡密无效或已使用',404)
@@ -374,7 +498,8 @@ def lookup_order(data:Lookup,request:Request):
 @app.get('/api/orders')
 def own_orders(request:Request):
     owner=identity(request)
-    with db() as c: return {'orders':[view_order(r) for r in c.execute('SELECT * FROM orders WHERE owner=? ORDER BY created DESC LIMIT 50',(owner,))]}
+    user=customer_session(request,False)
+    with db() as c: return {'orders':[view_order(r) for r in c.execute('SELECT * FROM orders WHERE customer_id=? OR (customer_id IS NULL AND owner=?) ORDER BY created DESC LIMIT 50',(user['id'] if user else '',owner))]}
 
 @app.post('/api/payment/callback')
 async def callback(request:Request):
@@ -400,7 +525,8 @@ async def callback(request:Request):
         if r['payment_ref']==ref: return {'ok':True}
         if r['state'] not in ('pending_payment','expired') or c.execute('SELECT 1 FROM orders WHERE payment_ref=?',(ref,)).fetchone(): fail('State conflict',409)
         state='queued' if r['credential'] and r['credential_expiry']>time.time() else 'needs_session'
-        c.execute('UPDATE orders SET state=?,payment_ref=?,updated=? WHERE id=?',(state,ref,int(time.time()),oid));event(c,oid,state)
+        c.execute('UPDATE orders SET state=?,payment_ref=?,paid_at=?,updated=? WHERE id=?',(state,ref,int(time.time()),int(time.time()),oid));event(c,oid,state)
+        audit_log(c,'payment.confirmed',oid,actor='payment',details={'amount_cents':amount})
     return {'ok':True}
 
 class Login(BaseModel):
@@ -435,13 +561,17 @@ def login(data:Login,request:Request):
             if role.startswith('staff:'):r=operator
             candidate=password_hash(data.password,r['password'].split(':')[0])
             if not hmac.compare_digest(candidate,r['password']) or data.username!=r['username']: fail('账号或密码不正确',401)
+        audit_log(c,'admin.login',data.username,locals().get('role','admin'),request)
     (DATA/'setup-code').unlink(missing_ok=True)
     return session_response(locals().get('role','admin'),{'ok':True})
 
 @app.post('/api/admin/logout')
 def logout(request:Request):
     raw=request.cookies.get(COOKIE,'')
-    with db() as c: c.execute('DELETE FROM sessions WHERE token=?',(digest(raw),))
+    with db() as c:
+        row=c.execute('SELECT role FROM sessions WHERE token=?',(digest(raw),)).fetchone()
+        c.execute('DELETE FROM sessions WHERE token=?',(digest(raw),))
+        if row:audit_log(c,'admin.logout',actor=row['role'],request=request)
     r=JSONResponse({'ok':True});r.delete_cookie(COOKIE,path='/',secure=SECURE,httponly=True,samesite='strict');return r
 
 @app.get('/api/admin/dashboard')
@@ -452,6 +582,10 @@ def dashboard(request:Request):
         result={'role':'admin' if actor=='admin' else 'staff','actor':actor,'orders':orders,'tickets':[ticket_view(r) for r in c.execute('SELECT * FROM tickets ORDER BY updated DESC LIMIT 200')], 'stats':{'orders':c.execute('SELECT COUNT(*) FROM orders').fetchone()[0],'ready_cards':c.execute("SELECT COUNT(*) FROM cards WHERE state='ready'").fetchone()[0],'paid_cents':c.execute('SELECT COALESCE(SUM(price),0) FROM orders WHERE payment_ref IS NOT NULL').fetchone()[0]},'products':[], 'cards':[], 'settings':{},'staff':[]}
         if actor=='admin':
             result.update(products=[view_product(r) for r in c.execute("SELECT * FROM products WHERE id!='plus-3' ORDER BY sort_order,id")],cards=[dict(r) for r in c.execute('SELECT tail,product_id,state,created,order_id FROM cards ORDER BY created DESC LIMIT 200')],settings={'payment_url':cfg(c,'payment_url'),'payment_secret_set':bool(cfg(c,'payment_secret')),'provider_url':cfg(c,'provider_url'),'provider_key_set':bool(cfg(c,'provider_key'))},staff=[dict(r) for r in c.execute('SELECT username,active,created FROM staff ORDER BY created')])
+        if actor=='admin':
+            mail=mail_config(c)
+            result['email_settings']={k:v for k,v in mail.items() if k!='password'}
+            result['email_settings']['password_set']=bool(mail['password'])
         return result
 
 class ProductInput(BaseModel):
@@ -474,7 +608,7 @@ def product_edit(data:ProductInput,request:Request):
                 fail('已有订单或卡密的商品不能更换品类或档位',409)
         c.execute('INSERT INTO products(id,title,months,price,active,category,tier,price_configured) VALUES(?,?,1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,price=excluded.price,active=excluded.active,category=excluded.category,tier=excluded.tier,price_configured=excluded.price_configured',(data.id,data.title,data.price or 1,data.active,data.category,data.tier,data.price is not None))
         c.execute("UPDATE products SET price_source='后台设定' WHERE id=?",(data.id,))
-        c.execute('INSERT INTO audit(action,target,created) VALUES(?,?,?)',('product.update',data.id,int(time.time())))
+        audit_log(c,'product.update',data.id,'admin',request,details={'price':data.price,'active':data.active})
     return {'ok':True}
 
 class CardsInput(BaseModel):
@@ -488,7 +622,7 @@ def generate_cards(data:CardsInput,request:Request):
     with db() as c:
         if not c.execute('SELECT 1 FROM products WHERE id=?',(data.product_id,)).fetchone(): fail('商品不存在')
         c.executemany('INSERT INTO cards(hash,tail,product_id,created) VALUES(?,?,?,?)',[(digest(x),x[-6:],data.product_id,int(time.time())) for x in codes])
-        c.execute('INSERT INTO audit(action,target,created) VALUES(?,?,?)',('cards.generate',data.product_id+':'+str(data.count),int(time.time())))
+        audit_log(c,'cards.generate',data.product_id,'admin',request,details={'count':data.count})
     return {'codes':codes}
 
 class SettingsInput(BaseModel):
@@ -511,7 +645,7 @@ def update_settings(data:SettingsInput,request:Request):
         savecfg(c,'payment_url',data.payment_url);savecfg(c,'provider_url',data.provider_url.rstrip('/'))
         if data.payment_secret: savecfg(c,'payment_secret',encrypt(data.payment_secret))
         if data.provider_key: savecfg(c,'provider_key',encrypt(data.provider_key))
-        c.execute('INSERT INTO audit(action,target,created) VALUES(?,?,?)',('settings.update','payment/provider',int(time.time())))
+        audit_log(c,'settings.update','payment/provider','admin',request)
     return {'ok':True}
 
 class StatusInput(BaseModel):
@@ -527,7 +661,7 @@ def order_status(data:StatusInput,request:Request):
         c.execute('BEGIN IMMEDIATE');r=c.execute('SELECT * FROM orders WHERE id=?',(data.order_id,)).fetchone()
         if not r or data.state not in allowed.get(r['state'],set()):fail('订单状态不允许此操作',409)
         c.execute('UPDATE orders SET state=?,evidence=?,credential=NULL,updated=? WHERE id=?',(data.state,data.evidence,int(time.time()),data.order_id));event(c,data.order_id,data.state)
-        c.execute('INSERT INTO audit(action,target,created) VALUES(?,?,?)',('order.'+data.state,data.order_id,int(time.time())))
+        audit_log(c,'order.'+data.state,data.order_id,'admin',request,details={'before':r['state'],'after':data.state})
     return {'ok':True}
 
 @app.head('/')
@@ -600,7 +734,7 @@ def ticket_create(data:TicketCreate,request:Request):
         if old:return {'ticket':ticket_view(old),'lookup_key':key}
         if data.order_id:
             order=c.execute('SELECT * FROM orders WHERE id=?',(data.order_id,)).fetchone()
-            if not order or not (order['owner']==owner or (data.order_key and hmac.compare_digest(order['lookup_hash'],digest(data.order_key)))):fail('订单号或查询码不正确',404)
+            if not order or not (order['owner']==owner or (customer_session(request,False) and order['customer_id']==customer_session(request,False)['id']) or (data.order_key and hmac.compare_digest(order['lookup_hash'],digest(data.order_key)))):fail('订单号或查询码不正确',404)
         if c.execute("SELECT COUNT(*) FROM tickets WHERE owner=? AND state!='closed'",(owner,)).fetchone()[0]>=3:fail('请先在已有工单中补充问题',429)
         if c.execute('SELECT COUNT(*) FROM tickets WHERE source_hash=? AND created>?',(source,now-86400)).fetchone()[0]>=10:fail('今日提交次数较多，请在已有工单中继续沟通',429)
         c.execute('INSERT INTO tickets(id,owner,lookup_hash,source_hash,topic,subject,order_id,created,updated) VALUES(?,?,?,?,?,?,?,?,?)',(tid,owner,digest(key),source,data.topic,subject,data.order_id or None,now,now))
@@ -672,7 +806,7 @@ def staff_ticket_reply(data:TicketReply,request:Request):
         if c.execute('SELECT 1 FROM ticket_messages WHERE request_key=?',(key,)).fetchone():return {'ok':True}
         c.execute('INSERT INTO ticket_messages(ticket_id,author,body,created,request_key) VALUES(?,?,?,?,?)',(r['id'],'staff',body,now,key))
         c.execute("UPDATE tickets SET state='replied',assignee=?,updated=? WHERE id=?",(actor,now,r['id']))
-        c.execute('INSERT INTO audit(action,target,created,actor) VALUES(?,?,?,?)',('ticket.reply',r['id'],now,actor))
+        audit_log(c,'ticket.reply',r['id'],actor,request)
     return {'ok':True}
 
 class BulkInput(BaseModel):
@@ -696,7 +830,7 @@ def bulk_orders(data:BulkInput,request:Request):
                     c.execute("UPDATE orders SET state='expired',credential=NULL,credential_expiry=0,updated=? WHERE id=?",(now,oid));event(c,oid,'expired')
             elif r['state'] not in ('pending_payment','queued','needs_session'):reason='此状态不能暂停或恢复'
             else:c.execute('UPDATE orders SET review=?,updated=? WHERE id=?',(int(data.action=='hold'),now,oid))
-            if not reason:c.execute('INSERT INTO audit(action,target,created,actor) VALUES(?,?,?,?)',('bulk.'+data.action,oid,now,actor))
+            if not reason:audit_log(c,'bulk.'+data.action,oid,actor,request)
             results.append({'id':oid,'ok':not reason,'reason':reason})
     return {'results':results}
 
@@ -713,7 +847,7 @@ def bulk_tickets(data:BulkInput,request:Request):
             elif r['assignee'] and r['assignee']!=actor and actor!='admin':reason='已由其他运营接手'
             elif data.action=='claim':c.execute('UPDATE tickets SET assignee=?,updated=? WHERE id=?',(actor,now,tid))
             else:c.execute('UPDATE tickets SET state=?,updated=? WHERE id=?',('closed' if data.action=='close' else 'open',now,tid))
-            if not reason:c.execute('INSERT INTO audit(action,target,created,actor) VALUES(?,?,?,?)',('ticket.'+data.action,tid,now,actor))
+            if not reason:audit_log(c,'ticket.'+data.action,tid,actor,request)
             results.append({'id':tid,'ok':not reason,'reason':reason})
     return {'results':results}
 
@@ -741,7 +875,7 @@ def bulk_results(data:BulkResults,request:Request):
             elif len(item.evidence.strip())<4:reason='请填写真实凭证编号'
             else:
                 c.execute('UPDATE orders SET state=?,evidence=?,credential=NULL,updated=? WHERE id=?',(item.state,item.evidence.strip(),now,item.order_id));event(c,item.order_id,item.state)
-                c.execute('INSERT INTO audit(action,target,created,actor) VALUES(?,?,?,?)',('bulk.result.'+item.state,item.order_id,now,actor))
+                audit_log(c,'bulk.result.'+item.state,item.order_id,actor,request,details={'before':r['state'],'after':item.state})
             results.append({'id':item.order_id,'ok':not reason,'reason':reason})
     return {'results':results}
 
@@ -764,19 +898,20 @@ def staff_manage(data:StaffInput,request:Request):
         elif data.password:c.execute('UPDATE staff SET password=?,active=? WHERE username=?',(password_hash(data.password),int(data.active),data.username))
         else:c.execute('UPDATE staff SET active=? WHERE username=?',(int(data.active),data.username))
         c.execute('DELETE FROM sessions WHERE role=?',('staff:'+data.username,))
-        c.execute('INSERT INTO audit(action,target,created,actor) VALUES(?,?,?,?)',('staff.update',data.username,int(time.time()),'admin'))
+        audit_log(c,'staff.update',data.username,'admin',request,details={'active':data.active,'password_changed':bool(data.password)})
     return {'ok':True}
 
 @app.get('/api/admin/orders')
-def search_orders(request:Request,state:str='',q:str='',page:int=1):
+def search_orders(request:Request,state:str='',q:str='',page:int=1,start:str='',end:str=''):
     staff_identity(request)
     if page<1 or page>100000 or len(q)>100 or len(state)>30:fail('查询条件无效')
-    where='WHERE (?=\'\' OR state=?) AND (?=\'\' OR instr(id,?)>0 OR instr(email,?)>0)'
-    args=(state,state,q,q,q)
+    since,until=date_range(start,end)
+    where="WHERE created>=? AND created<? AND (?='' OR state=?) AND (?='' OR instr(id,?)>0 OR instr(email,?)>0 OR customer_id IN (SELECT id FROM customers WHERE instr(username,?)>0))"
+    args=(since,until,state,state,q,q,q,q)
     with db() as c:
         total=c.execute('SELECT COUNT(*) FROM orders '+where,args).fetchone()[0]
         rows=c.execute('SELECT * FROM orders '+where+' ORDER BY created DESC,id LIMIT 100 OFFSET ?',(*args,(page-1)*100))
-        return {'orders':[{**view_order(r),'review':bool(r['review'])} for r in rows],'total':total,'page':page}
+        return {'orders':[{**view_order(r),'review':bool(r['review']),'buyer':(c.execute('SELECT username FROM customers WHERE id=?',(r['customer_id'],)).fetchone() or ['历史访客'])[0],'has_delivery':bool(c.execute('SELECT 1 FROM deliveries WHERE order_id=?',(r['id'],)).fetchone())} for r in rows],'total':total,'page':page}
 
 @app.get('/api/admin/tickets')
 def search_tickets(request:Request,state:str='',q:str='',page:int=1,mine:bool=False):
@@ -788,3 +923,311 @@ def search_tickets(request:Request,state:str='',q:str='',page:int=1,mine:bool=Fa
         total=c.execute('SELECT COUNT(*) FROM tickets '+where,args).fetchone()[0]
         rows=c.execute('SELECT * FROM tickets '+where+' ORDER BY updated DESC,id LIMIT 100 OFFSET ?',(*args,(page-1)*100))
         return {'tickets':[ticket_view(r) for r in rows],'total':total,'page':page}
+
+# Customer authentication is separate from operator sessions.
+class CustomerLogin(BaseModel):
+    username:str=Field(pattern=r'^[A-Za-z0-9_-]{3,40}$')
+    password:str=Field(min_length=12,max_length=128)
+
+@app.get('/api/account')
+def account_state(request:Request):
+    user=customer_session(request,False)
+    with db() as c:
+        grant=bool(user and c.execute('SELECT 1 FROM checkout_grants WHERE owner=? AND expires>?',(user['session_token'],int(time.time()))).fetchone())
+        return {'user':customer_view(user) if user else None,'purchase_verified':grant,'email_available':mail_ready(c)}
+
+@app.post('/api/account/register')
+def customer_register(data:CustomerLogin,request:Request):
+    limited(request,'customer-register',3)
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        email_limit(c,'registration:'+source_hash(request),10,86400)
+        if c.execute('SELECT 1 FROM customers WHERE username=?',(data.username,)).fetchone():fail('该账号名不可用',409)
+        uid='U'+secrets.token_hex(12)
+        c.execute('INSERT INTO customers(id,username,password,created) VALUES(?,?,?,?)',(uid,data.username,password_hash(data.password),int(time.time())))
+        audit_log(c,'account.register',uid,'customer:'+uid,request)
+        return issue_customer_session(c,uid,request)
+
+@app.post('/api/account/login')
+def customer_login(data:CustomerLogin,request:Request):
+    limited(request,'customer-login',5)
+    with db() as c:
+        user=c.execute('SELECT * FROM customers WHERE username=?',(data.username,)).fetchone()
+        if not valid_password(data.password,user['password'] if user else '') or not user or not user['active']:fail('账号或密码不正确，或账号已停用',401)
+        c.execute('BEGIN IMMEDIATE')
+        # Ensure a concurrently disabled account cannot receive a usable session.
+        if not c.execute('SELECT 1 FROM customers WHERE id=? AND active=1 AND password=?',(user['id'],user['password'])).fetchone():fail('账号状态已变更，请重新登录',401)
+        audit_log(c,'account.login',user['id'],'customer:'+user['id'],request)
+        return issue_customer_session(c,user['id'],request)
+
+@app.post('/api/account/logout')
+def customer_logout(request:Request):
+    user=customer_session(request,False);token=digest(request.cookies.get(USER_COOKIE,''))
+    with db() as c:
+        c.execute('DELETE FROM customer_sessions WHERE token=?',(token,))
+        c.execute('DELETE FROM checkout_grants WHERE owner=?',(token,))
+        if user:audit_log(c,'account.logout',user['id'],'customer:'+user['id'],request)
+    out=JSONResponse({'ok':True});out.delete_cookie(USER_COOKIE,path='/',secure=SECURE,httponly=True,samesite='strict');return out
+
+class EmailRequest(BaseModel):
+    purpose:str=Field(pattern=r'^(bind|purchase|reset)$')
+    email:str=Field(default='',max_length=254)
+
+@app.post('/api/account/email/send')
+def email_send(data:EmailRequest,request:Request):
+    limited(request,'email-send',5)
+    if data.purpose=='reset':
+        owner=identity(request);email=normalize_email(data.email)
+        with db() as c:user=c.execute('SELECT * FROM customers WHERE email=? AND email_verified=1 AND active=1',(email,)).fetchone()
+    else:
+        user=customer_session(request);owner=user['session_token']
+        if data.purpose=='bind':
+            if user['email_verified']:fail('邮箱已绑定，请使用购买验证',409)
+            email=normalize_email(data.email)
+        else:
+            if not user['email_verified']:fail('请先绑定邮箱',403)
+            email=user['email']
+    challenge=secrets.token_urlsafe(24);code=f'{secrets.randbelow(1000000):06d}';now=int(time.time())
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        if not mail_ready(c):fail('邮箱验证服务暂不可用，请稍后重试',503)
+        email_limit(c,'ip:'+source_hash(request),20,3600)
+        email_limit(c,'email:'+email,1,60);email_limit(c,'email:'+email,5,3600)
+        if user:email_limit(c,'user:'+user['id'],5,3600)
+        config=mail_config(c)
+        c.execute('DELETE FROM email_challenges WHERE expires<?',(now-86400,))
+        if user:
+            if data.purpose=='bind' and c.execute('SELECT 1 FROM customers WHERE email=? AND id!=?',(email,user['id'])).fetchone():fail('该邮箱不可绑定',409)
+            c.execute('UPDATE email_challenges SET consumed=1 WHERE user_id=? AND purpose=? AND owner=?',(user['id'],data.purpose,owner))
+            c.execute('INSERT INTO email_challenges(id,user_id,owner,email,purpose,code_hash,created,expires) VALUES(?,?,?,?,?,?,?,?)',(challenge,user['id'],owner,email,data.purpose,digest(challenge+':'+code),now,now+600))
+    if user:
+        try:send_email_code(config,email,code,data.purpose)
+        except Exception:
+            with db() as c:audit_log(c,'email.send',user['id'],'customer:'+user['id'],request,result='failed',details={'purpose':data.purpose})
+            fail('验证码发送失败，请稍后重试',503)
+        with db() as c:
+            c.execute('UPDATE email_challenges SET delivered=1 WHERE id=?',(challenge,))
+            audit_log(c,'email.send',user['id'],'customer:'+user['id'],request,details={'purpose':data.purpose})
+    # A random challenge for unknown reset addresses prevents account enumeration.
+    return {'challenge_id':challenge,'expires_in':600,'retry_after':60}
+
+class EmailVerify(BaseModel):
+    challenge_id:str=Field(min_length=20,max_length=100)
+    code:str=Field(pattern=r'^\d{6}$')
+    new_password:str=Field(default='',max_length=128)
+
+@app.post('/api/account/email/verify')
+def email_verify(data:EmailVerify,request:Request):
+    limited(request,'email-verify',10);now=int(time.time());error=None
+    user=customer_session(request,False)
+    owners={digest(request.cookies.get(COOKIE,'')),digest(request.cookies.get(USER_COOKIE,''))}
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        row=c.execute('SELECT e.*,u.active FROM email_challenges e JOIN customers u ON u.id=e.user_id WHERE e.id=?',(data.challenge_id,)).fetchone()
+        if not row or row['owner'] not in owners or not row['active'] or not row['delivered'] or row['consumed'] or row['expires']<=now or row['attempts']>=5:
+            error='验证码无效或已过期，请重新获取'
+        elif row['purpose']!='reset' and (not user or user['id']!=row['user_id']):error='请重新登录后验证'
+        elif not hmac.compare_digest(row['code_hash'],digest(row['id']+':'+data.code)):
+            c.execute('UPDATE email_challenges SET attempts=attempts+1 WHERE id=?',(row['id'],));error='验证码不正确'
+        elif row['purpose']=='reset' and len(data.new_password)<12:error='新密码至少 12 位'
+        elif row['purpose']=='bind' and c.execute('SELECT 1 FROM customers WHERE email=? AND id!=?',(row['email'],row['user_id'])).fetchone():error='该邮箱不可绑定'
+        else:
+            c.execute('UPDATE email_challenges SET consumed=1 WHERE id=?',(row['id'],))
+            if row['purpose']=='reset':
+                c.execute('UPDATE customers SET password=? WHERE id=?',(password_hash(data.new_password),row['user_id']))
+                c.execute('DELETE FROM customer_sessions WHERE user_id=?',(row['user_id'],));c.execute('DELETE FROM checkout_grants WHERE user_id=?',(row['user_id'],))
+                c.execute('UPDATE email_challenges SET consumed=1 WHERE user_id=?',(row['user_id'],))
+            else:
+                if row['purpose']=='bind':
+                    c.execute('UPDATE customers SET email=?,email_verified=1 WHERE id=?',(row['email'],row['user_id']))
+                    c.execute("UPDATE email_challenges SET consumed=1 WHERE user_id=? AND purpose='bind'",(row['user_id'],))
+                c.execute('INSERT INTO checkout_grants VALUES(?,?,?) ON CONFLICT(owner) DO UPDATE SET expires=excluded.expires',(row['owner'],row['user_id'],now+600))
+            audit_log(c,'email.verify.'+row['purpose'],row['user_id'],'customer:'+row['user_id'],request)
+        if error:audit_log(c,'email.verify','challenge',actor='customer:'+user['id'] if user else 'anonymous',request=request,result='denied')
+    if error:fail(error,400)
+    return {'ok':True,'purpose':row['purpose']}
+
+class PasswordChange(BaseModel):
+    current_password:str=Field(max_length=128)
+    new_password:str=Field(min_length=12,max_length=128)
+
+@app.post('/api/account/password')
+def customer_password(data:PasswordChange,request:Request):
+    limited(request,'password-change',5);user=customer_session(request)
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        current=c.execute('SELECT password FROM customers WHERE id=?',(user['id'],)).fetchone()
+        if not valid_password(data.current_password,current['password']):fail('当前密码不正确',403)
+        c.execute('UPDATE customers SET password=? WHERE id=?',(password_hash(data.new_password),user['id']))
+        c.execute('DELETE FROM customer_sessions WHERE user_id=?',(user['id'],));c.execute('DELETE FROM checkout_grants WHERE user_id=?',(user['id'],))
+        c.execute('UPDATE email_challenges SET consumed=1 WHERE user_id=?',(user['id'],))
+        audit_log(c,'account.password',user['id'],'customer:'+user['id'],request)
+    return {'ok':True}
+
+class MailSettings(BaseModel):
+    host:str=Field(pattern=r'^[a-zA-Z0-9.-]{1,253}$')
+    port:int=Field(ge=1,le=65535)
+    username:str=Field(min_length=1,max_length=254)
+    password:str=Field(default='',max_length=256)
+    sender:str=Field(max_length=254)
+
+@app.post('/api/admin/email-settings')
+def email_settings(data:MailSettings,request:Request):
+    identity(request,True)
+    if data.port not in (465,587):fail('请选择 465（TLS）或 587（STARTTLS）')
+    sender=normalize_email(data.sender)
+    if data.host.lower()=='localhost' or data.host.lower().endswith(('.local','.internal')):fail('邮箱服务器地址不可用')
+    with db() as c:
+        for key,value in {'host':data.host,'port':str(data.port),'username':data.username,'sender':sender}.items():savecfg(c,'smtp_'+key,value)
+        if data.password:savecfg(c,'smtp_password',encrypt(data.password))
+        if not cfg(c,'smtp_password'):fail('请填写 SMTP 授权码')
+        audit_log(c,'settings.email','smtp','admin',request)
+    return {'ok':True}
+
+@app.get('/api/admin/customers')
+def customers_search(request:Request,q:str='',page:int=1):
+    identity(request,True)
+    if len(q)>100 or not 1<=page<=100000:fail('查询条件无效')
+    where="WHERE ?='' OR instr(username,?)>0 OR instr(COALESCE(email,''),?)>0 OR id=?";args=(q,q,q,q)
+    with db() as c:
+        total=c.execute('SELECT COUNT(*) FROM customers '+where,args).fetchone()[0]
+        rows=c.execute('SELECT * FROM customers '+where+' ORDER BY created DESC,id LIMIT 50 OFFSET ?',(*args,(page-1)*50)).fetchall()
+        return {'customers':[customer_view(r) for r in rows],'total':total,'page':page}
+
+class CustomerManage(BaseModel):
+    user_id:str=Field(max_length=40)
+    active:bool
+    password:str=Field(default='',max_length=128)
+    admin_password:str=Field(default='',max_length=128)
+
+@app.post('/api/admin/customers')
+def customer_manage(data:CustomerManage,request:Request):
+    identity(request,True)
+    if data.password and len(data.password)<12:fail('新密码至少 12 位')
+    with db() as c:
+        if data.password:reauthenticate_admin(c,request,data.admin_password)
+        c.execute('BEGIN IMMEDIATE')
+        if not c.execute('SELECT 1 FROM customers WHERE id=?',(data.user_id,)).fetchone():fail('账号不存在',404)
+        c.execute('UPDATE customers SET active=? WHERE id=?',(int(data.active),data.user_id))
+        if data.password:c.execute('UPDATE customers SET password=? WHERE id=?',(password_hash(data.password),data.user_id))
+        c.execute('DELETE FROM customer_sessions WHERE user_id=?',(data.user_id,));c.execute('DELETE FROM checkout_grants WHERE user_id=?',(data.user_id,))
+        c.execute('UPDATE email_challenges SET consumed=1 WHERE user_id=?',(data.user_id,))
+        audit_log(c,'customer.update',data.user_id,'admin',request,details={'active':data.active,'password_reset':bool(data.password)})
+    return {'ok':True}
+
+class DeliveryWrite(BaseModel):
+    order_id:str=Field(max_length=40)
+    account:str=Field(min_length=1,max_length=254)
+    password:str=Field(min_length=1,max_length=512)
+    admin_password:str=Field(max_length=128)
+    reason:str=Field(min_length=4,max_length=120)
+
+@app.post('/api/admin/delivery')
+def delivery_write(data:DeliveryWrite,request:Request):
+    identity(request,True)
+    with db() as c:
+        reauthenticate_admin(c,request,data.admin_password)
+        c.execute('BEGIN IMMEDIATE')
+        order=c.execute('SELECT * FROM orders WHERE id=?',(data.order_id,)).fetchone()
+        if not order or not (order['payment_ref'] or order['channel']=='card') or order['state'] in ('pending_payment','expired','refunded'):fail('仅可为已付款或已核销订单登记交付账号',409)
+        # The delivery account and password never appear in order lists or CSV exports.
+        c.execute('INSERT INTO deliveries VALUES(?,?,?,?) ON CONFLICT(order_id) DO UPDATE SET account=excluded.account,secret=excluded.secret,updated=excluded.updated',(data.order_id,encrypt(data.account),encrypt(data.password),int(time.time())))
+        audit_log(c,'delivery.write',data.order_id,'admin',request,details={'reason':support_text(data.reason)})
+    return {'ok':True}
+
+class DeliveryRead(BaseModel):
+    order_id:str=Field(max_length=40)
+    admin_password:str=Field(default='',max_length=128)
+    reason:str=Field(default='',max_length=120)
+
+@app.post('/api/admin/delivery/read')
+def delivery_read(data:DeliveryRead,request:Request):
+    identity(request,True)
+    if len(data.reason.strip())<4:fail('请填写至少 4 字的查看原因')
+    with db() as c:
+        reauthenticate_admin(c,request,data.admin_password)
+        row=c.execute('SELECT * FROM deliveries WHERE order_id=?',(data.order_id,)).fetchone()
+        if not row:fail('尚未登记交付账号',404)
+        audit_log(c,'delivery.reveal',data.order_id,'admin',request,details={'reason':support_text(data.reason)})
+        return {'account':decrypt(row['account']),'password':decrypt(row['secret']),'updated':row['updated']}
+
+@app.post('/api/orders/delivery')
+def customer_delivery(data:DeliveryRead,request:Request):
+    user=verified_customer(request);limited(request,'delivery-read',10)
+    with db() as c:
+        row=c.execute("SELECT d.* FROM deliveries d JOIN orders o ON o.id=d.order_id WHERE o.id=? AND o.customer_id=? AND o.state='completed'",(data.order_id,user['id'])).fetchone()
+        if not row:fail('交付信息暂不可用',404)
+        audit_log(c,'delivery.customer_reveal',data.order_id,'customer:'+user['id'],request)
+        return {'account':decrypt(row['account']),'password':decrypt(row['secret'])}
+
+@app.get('/api/orders/detail')
+def customer_order_detail(request:Request,order_id:str):
+    user=customer_session(request)
+    if len(order_id)>40:fail('订单不存在',404)
+    with db() as c:
+        row=c.execute('SELECT * FROM orders WHERE id=? AND customer_id=?',(order_id,user['id'])).fetchone()
+        if not row:fail('订单不存在',404)
+        lookup=base64.urlsafe_b64encode(hmac.new(KEY,('lookup:'+order_id).encode(),hashlib.sha256).digest()).decode()[:24]
+        return {'order':{**view_order(row),'has_delivery':bool(c.execute('SELECT 1 FROM deliveries WHERE order_id=?',(order_id,)).fetchone())},'lookup_key':lookup,'events':[dict(r) for r in c.execute('SELECT state,created FROM events WHERE order_id=? ORDER BY id',(order_id,))],'payment_url':payment_link(cfg(c,'payment_url'),order_id,row['price']) if row['state']=='pending_payment' and cfg(c,'payment_url') else ''}
+
+# Dates use Asia/Shanghai regardless of the server's timezone.
+CN_TZ=timezone(timedelta(hours=8))
+def date_range(start='',end=''):
+    try:
+        since=int(datetime.strptime(start,'%Y-%m-%d').replace(tzinfo=CN_TZ).timestamp()) if start else 0
+        until=int((datetime.strptime(end,'%Y-%m-%d').replace(tzinfo=CN_TZ)+timedelta(days=1)).timestamp()) if end else 4102444800
+        if since>=until:raise ValueError()
+        return since,until
+    except ValueError:fail('日期范围无效')
+
+@app.get('/api/admin/summary')
+def admin_summary(request:Request,start:str='',end:str=''):
+    staff_identity(request);since,until=date_range(start,end)
+    with db() as c:
+        rows=c.execute('SELECT COUNT(*) orders,COALESCE(SUM(quantity),0) quantity,COALESCE(SUM(price),0) ordered_cents FROM orders WHERE created>=? AND created<?',(since,until)).fetchone()
+        paid=c.execute('SELECT COUNT(*) count,COALESCE(SUM(price),0) amount FROM orders WHERE payment_ref IS NOT NULL AND paid_at>=? AND paid_at<?',(since,until)).fetchone()
+        refunded=c.execute('SELECT COUNT(*) count,COALESCE(SUM(price),0) amount FROM orders WHERE payment_ref IS NOT NULL AND refunded_at>=? AND refunded_at<?',(since,until)).fetchone()
+        redeemed=c.execute("SELECT COUNT(*) count,COALESCE(SUM(price),0) amount FROM orders WHERE channel='card' AND created>=? AND created<?",(since,until)).fetchone()
+        return {**dict(rows),'paid_orders':paid['count'],'paid_cents':paid['amount'],'refunded_cents':refunded['amount'],'net_cents':paid['amount']-refunded['amount'],'redeemed_orders':redeemed['count'],'redeemed_cents':redeemed['amount'],'pending_orders':c.execute("SELECT COUNT(*) FROM orders WHERE state='pending_payment'").fetchone()[0], 'by_day':[dict(r) for r in c.execute("SELECT date(paid_at,'unixepoch','+8 hours') day,COUNT(*) orders,SUM(price) amount FROM orders WHERE payment_ref IS NOT NULL AND paid_at>=? AND paid_at<? GROUP BY day ORDER BY day DESC LIMIT 31",(since,until))]}
+
+@app.get('/api/admin/audit')
+def audit_search(request:Request,q:str='',action:str='',result:str='',start:str='',end:str='',page:int=1):
+    identity(request,True);since,until=date_range(start,end)
+    if len(q)>100 or len(action)>80 or result not in ('','success','failed','denied') or not 1<=page<=100000:fail('查询条件无效')
+    where="WHERE created>=? AND created<? AND (?='' OR action=?) AND (?='' OR result=?) AND (?='' OR instr(actor,?)>0 OR instr(target,?)>0)"
+    args=(since,until,action,action,result,result,q,q,q)
+    with db() as c:
+        total=c.execute('SELECT COUNT(*) FROM audit '+where,args).fetchone()[0]
+        rows=[dict(r) for r in c.execute('SELECT id,action,target,created,actor,source_hash,result,details FROM audit '+where+' ORDER BY id DESC LIMIT 50 OFFSET ?',(*args,(page-1)*50))]
+        return {'entries':rows,'total':total,'actions':[r[0] for r in c.execute('SELECT DISTINCT action FROM audit ORDER BY action')],'page':page}
+
+@app.post('/api/admin/audit/verify')
+def audit_verify(request:Request):
+    identity(request,True)
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE');previous='';count=0;valid=True
+        for row in c.execute('SELECT * FROM audit ORDER BY id'):
+            if row['previous_hash']!=previous or not hmac.compare_digest(audit_signature(row),row['entry_hash']):valid=False;break
+            previous=row['entry_hash'];count+=1
+        if valid:audit_log(c,'audit.verify','audit','admin',request,details={'entries':count,'head':previous})
+        return {'valid':valid,'checked':count,'head':previous}
+
+class ExportOrders(BaseModel):
+    q:str=Field(default='',max_length=100)
+    state:str=Field(default='',max_length=30)
+    start:str=Field(default='',max_length=10)
+    end:str=Field(default='',max_length=10)
+
+@app.post('/api/admin/orders/export')
+def export_orders(data:ExportOrders,request:Request):
+    actor=staff_identity(request);since,until=date_range(data.start,data.end)
+    with db() as c:
+        rows=c.execute("SELECT * FROM orders WHERE created>=? AND created<? AND (?='' OR state=?) AND (?='' OR instr(id,?)>0 OR instr(email,?)>0 OR customer_id IN (SELECT id FROM customers WHERE instr(username,?)>0)) ORDER BY created DESC LIMIT 5000",(since,until,data.state,data.state,data.q,data.q,data.q,data.q)).fetchall()
+        audit_log(c,'orders.export','orders',actor,request,details={'count':len(rows)})
+    def safe(value):
+        text=str(value or '')
+        return "'"+text if text.lstrip().startswith(('=','+','-','@')) else text
+    def stamp(value):return datetime.fromtimestamp(value,CN_TZ).isoformat() if value else ''
+    output=io.StringIO();writer=csv.writer(output);writer.writerow(['订单号','买家编号','商品','充值账号','数量','金额（元）','状态','下单时间','付款时间','完成时间','退款登记时间'])
+    for row in rows:writer.writerow([safe(x) for x in (row['id'],row['customer_id'],row['title'],row['email'],row['quantity'],f"{row['price']/100:.2f}",row['state'],stamp(row['created']),stamp(row['paid_at']),stamp(row['completed_at']),stamp(row['refunded_at']))])
+    return {'csv':'\ufeff'+output.getvalue(),'count':len(rows),'limit':5000}

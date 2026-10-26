@@ -12,6 +12,8 @@ backup=sqlite3.connect(target)
 source.backup(backup)
 backup.execute('UPDATE orders SET credential=NULL')
 backup.execute('DELETE FROM sessions')
+for table in ('customer_sessions','email_challenges','checkout_grants'):
+    if backup.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():backup.execute(f'DELETE FROM {table}')
 backup.commit();backup.execute('VACUUM');backup.close();source.close()
 # Back up the server encryption key separately with owner-only permissions.
 (folder/'encryption.key').write_bytes(Path('/var/lib/ai-carddesk/encryption.key').read_bytes())

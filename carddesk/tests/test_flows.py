@@ -4,6 +4,7 @@ import hmac
 import hashlib
 import time
 import sys
+import secrets
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +22,27 @@ def env(tmp_path,monkeypatch):
     m=importlib.reload(app)
     c=TestClient(m.app,base_url='https://card.example',headers={'origin':'https://card.example'})
     c.get('/api/session')
+    seed_customer(m,c)
     return m,c
+
+def seed_customer(m,c):
+    uid='U'+secrets.token_hex(8);raw=secrets.token_urlsafe(32)
+    with m.db() as db:
+        db.execute('INSERT INTO customers(id,username,password,email,email_verified,created) VALUES(?,?,?,?,1,?)',(uid,uid,m.password_hash('Customer-test-password-123'),uid+'@example.test',int(time.time())))
+        db.execute('INSERT INTO customer_sessions VALUES(?,?,?)',(m.digest(raw),uid,int(time.time())+3600))
+    c.cookies.set(m.USER_COOKIE,raw)
+    return uid
+
+def purchase_client(m,c):
+    # Each test purchase uses a separately verified browser session for the same buyer.
+    with m.db() as db:
+        user=db.execute('SELECT user_id FROM customer_sessions WHERE token=?',(m.digest(c.cookies.get(m.USER_COOKIE)),)).fetchone()[0]
+        raw=secrets.token_urlsafe(32);token=m.digest(raw)
+        db.execute('INSERT INTO customer_sessions VALUES(?,?,?)',(token,user,int(time.time())+3600))
+        db.execute('INSERT INTO checkout_grants VALUES(?,?,?)',(token,user,int(time.time())+600))
+    client=TestClient(m.app,base_url='https://card.example',headers={'origin':'https://card.example'},cookies=dict(c.cookies))
+    client.cookies.set(m.USER_COOKIE,raw)
+    return client
 
 def session():
     return json.dumps({'user':{'email':'fixture@example.test'},'accessToken':'test-only-token-never-a-real-account','expires':datetime.fromtimestamp(time.time()+3600,timezone.utc).isoformat()})
@@ -35,7 +56,7 @@ def configure(m):
 
 def order(c,**kw):
     data={'product_id':'plus-1','session':session(),'email':'fixture@example.test','idempotency_key':'a-unique-test-order-key-12345','consent':True};data.update(kw)
-    return c.post('/api/orders',json=data)
+    return purchase_client(sys.modules['app'],c).post('/api/orders',json=data)
 
 def admin(m,c):
     return c.post('/api/admin/login',json={'username':'test-admin','password':'A-long-test-password-123','setup_code':(m.DATA/'setup-code').read_text()})
@@ -211,7 +232,7 @@ def new_ticket(c,**kw):
 
 def stranger(m):
     c=TestClient(m.app,base_url='https://card.example',headers={'origin':'https://card.example'})
-    c.get('/api/session');return c
+    c.get('/api/session');seed_customer(m,c);return c
 
 def test_ticket_ownership_lookup_and_safe_content(env):
     m,c=env;r=new_ticket(c).json();tid=r['ticket']['id'];other=stranger(m)
