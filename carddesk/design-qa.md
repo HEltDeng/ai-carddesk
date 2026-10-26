@@ -10,12 +10,12 @@ Visual source: https://vipcz.vip/. User explicitly requested white original-colo
 
 - Source desktop: `../outputs/vipcz-reference/desktop-all.png`, 1470 × 746.
 - Source mobile: `../outputs/vipcz-reference/mobile-all.png`, 390 × 844.
-- Implementation desktop: `../outputs/carddesk-v4-desktop.png`, full page 1470 × 2977, viewport 1470 × 746.
-- Implementation mobile: `../outputs/carddesk-v4-mobile.png`, 390 × 844, scrollY 0; all five category controls completely visible, final Codex tab ends at x=364 inside a 390px viewport.
-- Narrow mobile: `../outputs/carddesk-v4-mobile-320.png`, 320 × 740.
-- Combined full-view comparisons: `../outputs/carddesk-v4-comparison-desktop.png`, `../outputs/carddesk-v4-comparison-mobile.png`. Desktop full-page capture is cropped to the matching viewport height for comparison; no density rescaling.
-- Combined focused card comparison: `../outputs/carddesk-v4-comparison-card.png`; original and current first Plus card cropped at equal 252px widths and aligned at card tops.
-- Additional states: `../outputs/carddesk-v4-help-mobile.png`, `../outputs/carddesk-v4-ticket.png`.
+- Implementation desktop: `../outputs/图片/carddesk-v4-desktop.png`, full page 1470 × 2977, viewport 1470 × 746.
+- Implementation mobile: `../outputs/图片/carddesk-v4-mobile.png`, 390 × 844, scrollY 0; all five category controls completely visible, final Codex tab ends at x=364 inside a 390px viewport.
+- Narrow mobile: `../outputs/图片/carddesk-v4-mobile-320.png`, 320 × 740.
+- Combined full-view comparisons: `../outputs/图片/carddesk-v4-comparison-desktop.png`, `../outputs/图片/carddesk-v4-comparison-mobile.png`. Desktop full-page capture is cropped to the matching viewport height for comparison; no density rescaling.
+- Combined focused card comparison: `../outputs/图片/carddesk-v4-comparison-card.png`; original and current first Plus card cropped at equal 252px widths and aligned at card tops.
+- Additional states: `../outputs/图片/carddesk-v4-help-mobile.png`, `../outputs/图片/carddesk-v4-ticket.png`.
 
 All captures have 1:1 pixel/CSS dimensions. Both source and implementation were opened together for visual comparison. Original desktop captures remain relevant to unchanged reference styling; current reference Codex and Claude product pages and purchase tutorial were revisited in Chrome.
 
