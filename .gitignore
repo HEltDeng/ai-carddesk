@@ -7,3 +7,11 @@ outputs/
 *.db-wal
 *.db-shm
 .env
+# Local research captures and rendered reports; keep the source tools in Git.
+research/evidence/
+research/merchants_raw.json
+research/sites-50.json
+research/AI代充站调研.html
+research/AI代充站调研报告.md
+research/50站点逐项调研.md
+research/一级直充支付链路调研.md
