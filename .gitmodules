@@ -1,0 +1,3 @@
+[submodule "ai-carddesk-web"]
+	path = carddesk/static
+	url = https://github.com/HEltDeng/ai-carddesk-web.git
