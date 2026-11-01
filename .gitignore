@@ -15,3 +15,7 @@ research/AI代充站调研.html
 research/AI代充站调研报告.md
 research/50站点逐项调研.md
 research/一级直充支付链路调研.md
+
+# Authored source input required to rebuild the research report.
+!research/AI代充站调研报告.md
+!research/一级直充支付链路调研.md
