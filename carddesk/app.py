@@ -20,13 +20,13 @@ from pathlib import Path
 from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
 from datetime import datetime, timedelta, timezone
 
-import httpx
 from cryptography.fernet import Fernet
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.middleware.body_limit import RequestBodyLimitMiddleware
 
 ROOT = Path(__file__).parent
 DATA = Path(os.environ.get('CARDDESK_DATA', ROOT / 'data'))
@@ -45,6 +45,24 @@ SECURE = ORIGIN.startswith('https://')
 COOKIE = '__Host-carddesk' if SECURE else 'carddesk_local'
 USER_COOKIE = '__Host-carddesk-user' if SECURE else 'carddesk_user_local'
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+def body_limit(path):
+    if path == '/api/admin/orders/results':
+        return 131072
+    if path == '/api/payment/callback':
+        return 4096
+    return 24576
+
+class BodyLimitMiddleware:
+    """Count actual streamed bytes, preserving each endpoint's existing limit."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        middleware = RequestBodyLimitMiddleware(self.app, max_body_size=body_limit(scope.get('path', '')))
+        await middleware(scope, receive, send)
+
+app.add_middleware(BodyLimitMiddleware)
 
 @contextmanager
 def db():
@@ -328,7 +346,9 @@ async def boundary(request,call_next):
         if request.url.path!='/api/payment/callback' and request.headers.get('origin') != ORIGIN:
             return JSONResponse({'detail':'请求来源无效'},403)
         try:
-            if int(request.headers.get('content-length','0'))>(131072 if request.url.path=='/api/admin/orders/results' else 24576): return JSONResponse({'detail':'内容过长'},413)
+            length = int(request.headers.get('content-length','0'))
+            if length < 0: raise ValueError
+            if length > body_limit(request.url.path): return JSONResponse({'detail':'内容过长'},413)
         except ValueError:
             return JSONResponse({'detail':'请求无效'},400)
     response=await call_next(request)

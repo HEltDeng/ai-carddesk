@@ -2,27 +2,49 @@
 import ipaddress
 import socket
 import time
-from urllib.parse import urlparse, quote
+from urllib.parse import quote
 import httpx
 from app import db, cfg, decrypt, event, expire_unpaid
 
 def public_endpoint(url):
-    host=urlparse(url).hostname
-    if not host:raise ValueError('No host')
-    for info in socket.getaddrinfo(host,443,type=socket.SOCK_STREAM):
-        if not ipaddress.ip_address(info[4][0]).is_global:raise ValueError('Private destination')
+    target = httpx.URL(url)
+    if (target.scheme != 'https' or not target.host or target.userinfo or target.fragment
+            or any(character.isspace() or ord(character) < 32 for character in url)
+            or '\\' in url):
+        raise ValueError('Invalid HTTPS destination')
+    addresses = socket.getaddrinfo(target.raw_host.decode('ascii'), target.port or 443,
+                                   type=socket.SOCK_STREAM)
+    if not addresses:
+        raise ValueError('No address')
+    for info in addresses:
+        address = ipaddress.ip_address(info[4][0])
+        if not address.is_global or address.is_multicast or address.is_reserved:
+            raise ValueError('Private destination')
+    return target, list(dict.fromkeys(info[4][0] for info in addresses))
 
 def provider_request(method,url,key,payload=None):
-    public_endpoint(url)
+    target, addresses = public_endpoint(url)
+    # Pin the validated address so a second DNS lookup cannot reach an internal
+    # service. Keep the original Host and TLS certificate hostname unchanged.
+    headers = {'Authorization':'Bearer '+key, 'Content-Type':'application/json',
+               'Host':target.netloc.decode('ascii')}
     with httpx.Client(timeout=15,follow_redirects=False,trust_env=False) as client:
-        with client.stream(method,url,headers={'Authorization':'Bearer '+key,'Content-Type':'application/json'},json=payload) as response:
-            response.raise_for_status()
-            raw=b''
-            for part in response.iter_bytes():
-                raw+=part
-                if len(raw)>32768:raise ValueError('Response too large')
-            import json
-            return json.loads(raw)
+        for index, address in enumerate(addresses):
+            try:
+                with client.stream(method, target.copy_with(host=address), headers=headers, json=payload,
+                                   extensions={'sni_hostname':target.raw_host.decode('ascii')}) as response:
+                    response.raise_for_status()
+                    raw=b''
+                    for part in response.iter_bytes():
+                        raw+=part
+                        if len(raw)>32768:raise ValueError('Response too large')
+                    import json
+                    return json.loads(raw)
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                # Preserve DNS address fallback only before an HTTP request can
+                # be sent. Never replay a POST after an ambiguous read/write error.
+                if index == len(addresses) - 1:
+                    raise
 
 def tick():
     now=int(time.time())

@@ -82,6 +82,40 @@ def test_origin_and_admin_boundaries(env):
     raw=TestClient(m.app,base_url='https://card.example').get('/api/session').headers['set-cookie']
     assert 'HttpOnly' in raw and 'Secure' in raw and '__Host-carddesk' in raw and 'SameSite=strict' in raw
 
+
+@pytest.mark.parametrize('length', [None, '1'])
+def test_body_limit_counts_streamed_bytes(env, length):
+    m, c = env
+    headers = {'content-type': 'application/json'}
+    if length is not None:
+        headers['content-length'] = length
+    response = c.post('/api/admin/login', headers=headers,
+                      content=iter([b'{}', b' ' * 24576]))
+    assert response.status_code == 413
+
+
+def test_payment_callback_stream_has_stricter_limit(env):
+    m, c = env
+    response = c.post('/api/payment/callback', content=iter([b'{}', b' ' * 4096]))
+    assert response.status_code == 413
+
+
+def test_bulk_results_keeps_existing_larger_limit(env):
+    m, c = env
+    assert admin(m, c).status_code == 200
+    body = json.dumps({'items': [{'order_id': 'MISSING-ORDER', 'expected_state': 'processing',
+                                 'state': 'completed', 'evidence': 'synthetic-proof'}]}).encode().ljust(30000, b' ')
+    response = c.post('/api/admin/orders/results', content=iter([body]),
+                      headers={'content-type': 'application/json'})
+    assert response.status_code == 200
+    assert response.json()['results'][0]['reason'] == '订单不存在'
+
+
+def test_negative_content_length_is_rejected(env):
+    m, c = env
+    response = c.post('/api/admin/login', content=b'{}', headers={'content-length': '-1'})
+    assert response.status_code == 400
+
 def test_one_use_admin_setup(env):
     m,c=env
     assert admin(m,c).status_code==200
