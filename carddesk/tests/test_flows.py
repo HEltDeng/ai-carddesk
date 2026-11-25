@@ -406,3 +406,23 @@ def test_paginated_staff_search_reaches_older_tickets(env):
     assert c.get('/api/admin/tickets?q=%27%20OR%201%3D1--').json()['tickets']==[]
     assert c.get('/api/admin/tickets?page=0').status_code==400
     assert c.get('/api/admin/orders?q=%27%20OR%201%3D1--').json()['orders']==[]
+
+
+def test_incomplete_payment_configuration_suppresses_checkout_links(env):
+    m, c = env
+    configure(m)
+    purchase = order(c).json()
+    assert purchase['payment_url'].startswith('https://payments.example/')
+    with m.db() as conn:
+        m.savecfg(conn, 'payment_secret', '')
+    assert not c.get('/api/catalog').json()['payment_enabled']
+    assert not c.get('/api/orders/detail', params={'order_id':purchase['order']['id']}).json()['payment_url']
+    assert not order(c).json()['payment_url']
+    assert order(c, idempotency_key=secrets.token_hex(16)).status_code == 409
+
+
+def test_storefront_serves_only_published_resources(env):
+    _, c = env
+    assert c.get('/static/app.js').status_code == 200
+    assert c.head('/static/brands/menu.svg').status_code == 200
+    assert c.get('/static/README.md').status_code == 404

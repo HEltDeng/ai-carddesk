@@ -3,16 +3,39 @@ import html
 import json
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
 rows = json.loads((ROOT/'sites-50.json').read_text())
 
+def link(label, url, *, css_class='', local_notes=False):
+    escaped_label = html.escape(label)
+    if any(char.isspace() or ord(char) < 32 or char == chr(92) for char in url):
+        return escaped_label
+    try:
+        parsed = urlsplit(url)
+        public_url = parsed.scheme in ('http', 'https') and parsed.hostname and not parsed.username and not parsed.password
+    except ValueError:
+        return escaped_label
+    if not public_url and not (local_notes and re.fullmatch(r'[\w.-]+\.md', url)):
+        return escaped_label
+    attribute = f' class="{css_class}"' if css_class else ''
+    return f'<a{attribute} href="{html.escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">{escaped_label}</a>'
+
 def inline(s):
-    s = html.escape(s)
-    s = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2" target="_blank" rel="noopener noreferrer">\1</a>', s)
-    s = re.sub(r'\*\*([^*]+)\*\*', r'<strong>\1</strong>', s)
-    s = re.sub(r'`([^`]+)`', r'<code>\1</code>', s)
-    return s
+    def format_text(value):
+        value = html.escape(value)
+        value = re.sub(r'\*\*([^*]+)\*\*', r'<strong>\1</strong>', value)
+        return re.sub(r'`([^`]+)`', r'<code>\1</code>', value)
+
+    parts = []
+    end = 0
+    for match in re.finditer(r'\[([^\]]+)\]\(([^)]+)\)', s):
+        parts.append(format_text(s[end:match.start()]))
+        parts.append(link(match[1], match[2], local_notes=True))
+        end = match.end()
+    parts.append(format_text(s[end:]))
+    return ''.join(parts)
 
 def markdown(text):
     lines = text.splitlines()
@@ -63,8 +86,8 @@ for row in rows:
     category = html.escape(row['category'], quote=True)
     cards.append(f'''<details class="card" data-search="{search}" data-category="{category}">
       <summary><span class="num">{row['id']:02d}</span><span class="entry"><b>{html.escape(row['name'])}</b><small>{html.escape(row['category'])} · {html.escape(row['evidence'])}</small></span><span class="price">{html.escape(row['price'])}</span><span class="chevron">＋</span></summary>
-      <div class="cardbody"><a class="source" href="{html.escape(row['url'])}" target="_blank" rel="noopener noreferrer">打开原站 ↗</a>
-      <dl>{''.join('<dt>'+label+'</dt><dd>'+html.escape(row[key])+'</dd>' for key,label in [('delivery','交付流程'),('payment','收款方式'),('terms','售后与约束'),('lesson','研究判断')])}</dl><p class="muted">核验：{row['checked_on']} · 公开自述，未实单验证</p></div></details>''')
+      <div class="cardbody">{link('打开原站 ↗', row['url'], css_class='source')}
+      <dl>{''.join('<dt>'+label+'</dt><dd>'+html.escape(row[key])+'</dd>' for key,label in [('delivery','交付流程'),('payment','收款方式'),('terms','售后与约束'),('lesson','研究判断')])}</dl><p class="muted">核验：{html.escape(str(row['checked_on']))} · 公开自述，未实单验证</p></div></details>''')
 
 body = markdown((ROOT/'AI代充站调研报告.md').read_text())
 categories = ''.join(f'<option>{html.escape(x)}</option>' for x in sorted({r['category'] for r in rows}))

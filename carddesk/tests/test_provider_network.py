@@ -102,3 +102,25 @@ def test_invalid_provider_urls_are_rejected_before_dns(env, monkeypatch, url):
     monkeypatch.setattr(worker.socket, 'getaddrinfo', unexpected_lookup)
     with pytest.raises(ValueError):
         worker.public_endpoint(url)
+
+
+@pytest.mark.parametrize('port', [465, 587])
+def test_mail_connects_to_resolved_address_with_original_tls_name(env, monkeypatch, port):
+    from unittest.mock import Mock
+
+    app, _ = env
+    resolve = Mock(return_value=addresses('1.1.1.1', port=port))
+    connect = Mock()
+    context = Mock()
+    monkeypatch.setattr(socket, 'getaddrinfo', resolve)
+    monkeypatch.setattr(socket, 'create_connection', connect)
+    monkeypatch.setattr(app.ssl, 'create_default_context', lambda: context)
+    client = app.PublicSMTP(local_hostname='client.example')
+    result = client._get_socket('mail.example', port, 12)
+    resolve.assert_called_once_with('mail.example', port, type=socket.SOCK_STREAM)
+    connect.assert_called_once_with(('1.1.1.1', port), 12, None)
+    if port == 465:
+        context.wrap_socket.assert_called_once_with(connect.return_value, server_hostname='mail.example')
+        assert result is context.wrap_socket.return_value
+    else:
+        assert result is connect.return_value

@@ -318,14 +318,39 @@ def mail_config(c):
 def mail_ready(c):
     return all(mail_config(c).values())
 
+class PublicSMTP(smtplib.SMTP):
+    def _get_socket(self, host, port, timeout):
+        # Resolve once and connect to those numeric addresses. smtplib keeps
+        # the configured hostname for certificate checks during STARTTLS.
+        answers = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        addresses = list(dict.fromkeys(info[4][0] for info in answers))
+        if not addresses:
+            raise ValueError('No mail server address')
+        for address in addresses:
+            ip = ipaddress.ip_address(address)
+            if not ip.is_global or ip.is_multicast or ip.is_reserved:
+                raise ValueError('Invalid mail host')
+        for index, address in enumerate(addresses):
+            try:
+                sock = socket.create_connection((address, port), timeout, self.source_address)
+            except OSError:
+                if index == len(addresses) - 1:
+                    raise
+                continue
+            if port == 465:
+                try:
+                    return ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+                except BaseException:
+                    sock.close()
+                    raise
+            return sock
+
 def send_email_code(config,email,code,purpose):
-    host=config['host'];port=int(config['port']);context=ssl.create_default_context()
-    if any(not ipaddress.ip_address(info[4][0]).is_global for info in socket.getaddrinfo(host,port,type=socket.SOCK_STREAM)):raise ValueError('Invalid mail host')
+    host=config['host'];port=int(config['port'])
     message=EmailMessage();message['From']=config['sender'];message['To']=email;message['Subject']='AI 卡台 · '+('重置密码' if purpose=='reset' else '邮箱验证码')
     message.set_content(f'你的验证码为：{code}\n\n10 分钟内有效，请勿转发。若非本人操作，请忽略此邮件。')
-    client=smtplib.SMTP_SSL(host,port,timeout=12,context=context) if port==465 else smtplib.SMTP(host,port,timeout=12)
-    with client:
-        if port!=465:client.ehlo();client.starttls(context=context);client.ehlo()
+    with PublicSMTP(host,port,timeout=12) as client:
+        if port!=465:client.ehlo();client.starttls(context=ssl.create_default_context());client.ehlo()
         client.login(config['username'],decrypt(config['password']))
         client.send_message(message)
 
@@ -389,10 +414,13 @@ def view_product(row):
     p['account_supported']=p['category']=='chatgpt'
     return p
 
+def payment_template(c):
+    return cfg(c,'payment_url') if cfg(c,'payment_secret') else ''
+
 @app.get('/api/catalog')
 def catalog():
     with db() as c:
-        return {'products':[view_product(r) for r in c.execute('SELECT * FROM products WHERE active=1 ORDER BY sort_order,id')], 'payment_enabled':bool(cfg(c,'payment_url')), 'fulfillment_enabled':bool(cfg(c,'provider_url') and cfg(c,'provider_key'))}
+        return {'products':[view_product(r) for r in c.execute('SELECT * FROM products WHERE active=1 ORDER BY sort_order,id')], 'payment_enabled':bool(payment_template(c)), 'fulfillment_enabled':bool(cfg(c,'provider_url') and cfg(c,'provider_key'))}
 
 class SessionInput(BaseModel):
     session: str = Field(max_length=18000)
@@ -441,6 +469,7 @@ def event(c,oid,state):
 
 def payment_link(template,oid,price):
     # Only order number and amount are appended; never credentials or personal data.
+    if not template:return ''
     u=urlparse(template)
     q=dict(parse_qsl(u.query));q.update(order_id=oid,amount=f'{price/100:.2f}')
     return urlunparse(u._replace(query=urlencode(q)))
@@ -458,7 +487,7 @@ def create_order(data:OrderInput,request:Request):
         old=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
         if old:
             if old['product_id']!=data.product_id or old['email'].lower()!=data.email.strip().lower() or old['channel']!=('card' if data.card else 'payment'):fail('重复请求与原订单不一致',409)
-            return {'order':view_order(old),'lookup_key':lookup,'payment_url':payment_link(cfg(c,'payment_url'),oid,old['price']) if old['state']=='pending_payment' else ''}
+            return {'order':view_order(old),'lookup_key':lookup,'payment_url':payment_link(payment_template(c),oid,old['price']) if old['state']=='pending_payment' else ''}
         # Recheck account status in the same write transaction as order creation.
         current=c.execute('SELECT active,email_verified FROM customers WHERE id=?',(user['id'],)).fetchone()
         if not current or not current['active'] or not current['email_verified']:fail('账号当前不可购买',403)
@@ -469,7 +498,7 @@ def create_order(data:OrderInput,request:Request):
         if p['category']!='chatgpt':fail('该品类通道暂不可用',409)
         if not p['price_configured']:fail('商品暂不可用',409)
         if not cfg(c,'provider_url') or not cfg(c,'provider_key'): fail('当前通道暂不可用',409)
-        if not data.card and not cfg(c,'payment_url'): fail('当前支付暂不可用',409)
+        if not data.card and not payment_template(c): fail('当前支付暂不可用',409)
         s=parse_session(data.session)
         if s['email'].lower()!=data.email.strip().lower(): fail('账号与 Session 不一致')
         if data.card:
@@ -490,7 +519,7 @@ def create_order(data:OrderInput,request:Request):
         event(c,oid,state)
         audit_log(c,'order.create',oid,actor='customer:'+user['id'],request=request,details={'channel':'card' if data.card else 'payment','amount_cents':p['price']})
         row=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
-        return {'order':view_order(row),'lookup_key':lookup,'payment_url':payment_link(cfg(c,'payment_url'),oid,p['price']) if not data.card else ''}
+        return {'order':view_order(row),'lookup_key':lookup,'payment_url':payment_link(payment_template(c),oid,p['price']) if not data.card else ''}
 
 class CardInput(BaseModel):
     card:str=Field(min_length=6,max_length=100)
@@ -564,26 +593,25 @@ def admin_state(request:Request):
 @app.post('/api/admin/login')
 def login(data:Login,request:Request):
     limited(request,'login',5)
+    role = 'admin'
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
         r=c.execute('SELECT * FROM admins WHERE id=1').fetchone()
         if not r:
             f=DATA/'setup-code'
-            if not f.exists() or not hmac.compare_digest(f.read_text().strip(),data.setup_code): fail('初始化码不正确',403)
+            if not f.exists() or not hmac.compare_digest(f.read_bytes().strip(),data.setup_code.encode()): fail('初始化码不正确',403)
             c.execute('INSERT INTO admins VALUES(1,?,?)',(data.username,password_hash(data.password)))
         else:
-            if data.username!=r['username']:
-                operator=c.execute('SELECT * FROM staff WHERE username=? AND active=1',(data.username,)).fetchone()
-                candidate=password_hash(data.password,operator['password'].split(':')[0] if operator else '0'*32)
-                if not operator or not hmac.compare_digest(candidate,operator['password']):fail('账号或密码不正确',401)
-                role='staff:'+operator['username']
-            else:role='admin'
-            if role.startswith('staff:'):r=operator
-            candidate=password_hash(data.password,r['password'].split(':')[0])
-            if not hmac.compare_digest(candidate,r['password']) or data.username!=r['username']: fail('账号或密码不正确',401)
-        audit_log(c,'admin.login',data.username,locals().get('role','admin'),request)
+            if data.username == r['username']:
+                account = r
+            else:
+                account = c.execute('SELECT * FROM staff WHERE username=? AND active=1',(data.username,)).fetchone()
+                role = 'staff:'+data.username
+            if not valid_password(data.password, account['password'] if account else ''):
+                fail('账号或密码不正确',401)
+        audit_log(c,'admin.login',data.username,role,request)
     (DATA/'setup-code').unlink(missing_ok=True)
-    return session_response(locals().get('role','admin'),{'ok':True})
+    return session_response(role,{'ok':True})
 
 @app.post('/api/admin/logout')
 def logout(request:Request):
@@ -693,7 +721,24 @@ def admin():return FileResponse(ROOT/'static/admin.html')
 @app.head('/service')
 @app.get('/service')
 def service():return FileResponse(ROOT/'static/service.html')
-app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
+
+class StorefrontFiles(StaticFiles):
+    # The development storefront is a nested Git checkout.
+    public_paths = {
+        'index.html', 'admin.html', 'service.html', 'icon.svg',
+        'app.js', 'account.js', 'help.js', 'admin.js', 'admin-extra.js',
+        'styles.css', 'storefront.css',
+        'brands/band-curve.svg', 'brands/chatgpt.svg', 'brands/claude.svg',
+        'brands/codex.svg', 'brands/grok.svg', 'brands/menu.svg',
+        'brands/LICENSE', 'brands/SOURCES.md',
+    }
+
+    async def get_response(self, path, scope):
+        if Path(path).as_posix() not in self.public_paths:
+            raise HTTPException(status_code=404)
+        return await super().get_response(path, scope)
+
+app.mount('/static',StorefrontFiles(directory=ROOT/'static'),name='static')
 
 class RefreshSession(Lookup):
     session:str=Field(max_length=18000)
@@ -1188,7 +1233,7 @@ def customer_order_detail(request:Request,order_id:str):
         row=c.execute('SELECT * FROM orders WHERE id=? AND customer_id=?',(order_id,user['id'])).fetchone()
         if not row:fail('订单不存在',404)
         lookup=base64.urlsafe_b64encode(hmac.new(KEY,('lookup:'+order_id).encode(),hashlib.sha256).digest()).decode()[:24]
-        return {'order':{**view_order(row),'has_delivery':bool(c.execute('SELECT 1 FROM deliveries WHERE order_id=?',(order_id,)).fetchone())},'lookup_key':lookup,'events':[dict(r) for r in c.execute('SELECT state,created FROM events WHERE order_id=? ORDER BY id',(order_id,))],'payment_url':payment_link(cfg(c,'payment_url'),order_id,row['price']) if row['state']=='pending_payment' and cfg(c,'payment_url') else ''}
+        return {'order':{**view_order(row),'has_delivery':bool(c.execute('SELECT 1 FROM deliveries WHERE order_id=?',(order_id,)).fetchone())},'lookup_key':lookup,'events':[dict(r) for r in c.execute('SELECT state,created FROM events WHERE order_id=? ORDER BY id',(order_id,))],'payment_url':payment_link(payment_template(c),order_id,row['price']) if row['state']=='pending_payment' else ''}
 
 # Dates use Asia/Shanghai regardless of the server's timezone.
 CN_TZ=timezone(timedelta(hours=8))
